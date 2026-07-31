@@ -121,8 +121,20 @@ async def models_gateway(request: Request):
     except Exception as e:
         upstream_status = f"error: {e}"
 
+    merged = []
+    for m in upstream_models:
+        if isinstance(m, dict):
+            mm = dict(m)
+            mm["enabled"] = True
+            merged.append(mm)
+        else:
+            merged.append(m)
+    for m in CUSTOM_MODELS.values():
+        mm = dict(m)
+        mm["enabled"] = True
+        merged.append(mm)
     return {
-        "models": upstream_models + list(CUSTOM_MODELS.values()),
+        "models": merged,
         "custom": list(CUSTOM_MODELS.values()),
         "upstream_count": len(upstream_models),
         "upstream_status": upstream_status,
