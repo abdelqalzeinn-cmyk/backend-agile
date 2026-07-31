@@ -182,7 +182,13 @@ def admin_models_sync():
             "ok": False,
             "error": f"OpenRouter fetch failed: {e}",
         }, status_code=502)
-    result = sync_openrouter_free_models()
+    try:
+        result = sync_openrouter_free_models()
+    except Exception as e:
+        return JSONResponse({
+            "ok": False,
+            "error": f"Sync failed: {e}",
+        }, status_code=500)
     return JSONResponse({
         "ok": True,
         "key_set": bool(OPENROUTER_KEY),
@@ -415,7 +421,7 @@ def sync_openrouter_free_models():
         "added": added,
         "skipped": [m.get("id") for m in models if m.get("id") in CUSTOM_MODELS],
         "total_free": len(models),
-        "sample": [m.get("id") for m in fetched[:5]],
+        "sample": [m.get("id") for m in models[:5]],
     }
 
 
