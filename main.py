@@ -257,13 +257,14 @@ async def proxy_post(path: str, request: Request):
             if formatted:
                 body.setdefault("tools", [])
                 # dedupe by name
-                existing = {t.get("name") for t in body["tools"] if isinstance(t, dict)}
+                existing = {((t.get("function") or {}).get("name")) for t in body["tools"] if isinstance(t, dict)}
                 for t in formatted:
-                    if t["name"] not in existing:
+                    fn_name = (t.get("function") or {}).get("name")
+                    if fn_name and fn_name not in existing:
                         body["tools"].append(t)
                 # lightweight system hint unless one already set
                 msgs = body.get("messages") or []
-                hint = "You may use gateway tools:" + ", ".join(t["name"] for t in formatted)
+                hint = "You may use gateway tools:" + ", ".join((t.get("function") or {}).get("name", "") for t in formatted)
                 if not any(isinstance(m, dict) and m.get("role") == "system" for m in msgs):
                     msgs = [{"role": "system", "content": hint}] + msgs
                     body["messages"] = msgs
