@@ -233,6 +233,22 @@ async def workspace(request: Request):
         return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
 
 
+@app.get("/conversations")
+async def conversations(request: Request):
+    h = dict(_proxy_headers())
+    a = request.headers.get("authorization") or request.headers.get("Authorization")
+    if a:
+        h["authorization"] = a
+    r = _proxy("GET", "/conversations", headers=h)
+    if r.status_code != 200:
+        return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+    try:
+        data = r.json()
+        return JSONResponse(content=data, status_code=200, headers={"Content-Encoding": "identity"})
+    except Exception:
+        return Response(content=r.content, status_code=r.status_code, headers={"Content-Encoding": "identity"})
+
+
 @app.get("/{path:path}")
 async def proxy_get(path: str, request: Request):
     h = dict(_proxy_headers())
