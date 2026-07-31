@@ -11,7 +11,6 @@ import uuid
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field
 import httpx
 
 UPSTREAM = os.environ.get("AGILEBOT_UPSTREAM", "https://api.agilebot.dev")
@@ -62,28 +61,7 @@ BUILTIN_TOOLS = {
 
 # ---------- Models ----------
 
-class AddToolRequest(BaseModel):
-    name: str
-    description: str
-    parameters: dict = Field(default_factory=dict)
-    handler: str | None = None  # optional external handler URL
 
-class AddModelRequest(BaseModel):
-    id: str
-    name: str
-    provider: str  # "openrouter", "local", "upstream"
-    endpoint: str | None = None
-    context_length: int = 8192
-    supports_tools: bool = False
-
-# ---------- Helpers ----------
-
-def _proxy_headers() -> dict:
-    return {
-        "content-type": "application/json",
-        "user-agent": "Mozilla/5.0 (AgileBot-Gateway/0.2)",
-        "accept": "application/json",
-    }
 
 def _add_auth(headers: dict, request: Request) -> dict:
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
@@ -278,11 +256,6 @@ async def proxy_post(path: str, request: Request):
     # Default: proxy everything else
     try:
         body = await request.json()
-    except Exception:
-        body = {}
-    h = dict(_proxy_headers())
-    r = _proxy("POST", f"/{path}", body=body, headers=_add_auth(h, request))
-    return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
     except Exception:
         body = {}
     h = dict(_proxy_headers())
