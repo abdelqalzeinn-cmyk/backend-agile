@@ -249,6 +249,17 @@ async def conversations(request: Request):
         return Response(content=r.content, status_code=r.status_code, headers={"Content-Encoding": "identity"})
 
 
+@app.post("/conversations")
+async def conversations_post(request: Request):
+    h = dict(_proxy_headers())
+    a = request.headers.get("authorization") or request.headers.get("Authorization")
+    if a:
+        h["authorization"] = a
+    body = await request.body()
+    r = _proxy("POST", "/conversations", body=body, headers=h)
+    return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+
+
 @app.get("/{path:path}")
 async def proxy_get(path: str, request: Request):
     h = dict(_proxy_headers())
