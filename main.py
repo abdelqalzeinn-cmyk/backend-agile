@@ -346,12 +346,9 @@ def sync_openrouter_free_models():
         "added": added,
         "skipped": [m.get("id") for m in models if m.get("id") in CUSTOM_MODELS],
         "total_free": len(models),
-        "sample": [m.get("id") for m in models[:5]],
+        "sample": [m.get("id") for m in fetched[:5]],
     }
 
-
-        save_json(CUSTOM_MODELS_FILE, CUSTOM_MODELS)
-    return {"ok": True}
 
 # ---------- Merged catalog endpoints ----------
 
