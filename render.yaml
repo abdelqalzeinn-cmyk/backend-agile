@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: agilebot-backend
+    runtime: python-3.11
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: AGILEBOT_UPSTREAM
+        value: https://api.agilebot.dev
+      - key: PORT
+        value: "8765"
