@@ -138,7 +138,7 @@ def admin_tools_list():
 @app.post("/admin/tools")
 async def admin_tools_add(request: Request):
     body = await request.json()
-    req = AddToolRequest(**body)
+    req = body
     return add_admin_tool(req)
 
 @app.delete("/admin/tools/{name}")
@@ -176,7 +176,7 @@ def admin_models_sync():
 @app.post("/admin/models")
 async def admin_models_add(request: Request):
     body = await request.json()
-    req = AddModelRequest(**body)
+    req = body
     return add_admin_model(req)
 
 @app.delete("/admin/models/{model_id}")
@@ -350,7 +350,7 @@ def list_admin_tools():
     return {"tools": list(CUSTOM_TOOLS.values())}
 
 @app.post("/admin/tools")
-def add_admin_tool(req: AddToolRequest):
+def add_admin_tool(req):
     CUSTOM_TOOLS[req.name] = {
         "name": req.name,
         "description": req.description,
@@ -375,7 +375,7 @@ def list_admin_models():
     return {"models": list(CUSTOM_MODELS.values())}
 
 @app.post("/admin/models")
-def add_admin_model(req: AddModelRequest):
+def add_admin_model(req):
     CUSTOM_MODELS[req.id] = {
         "id": req.id,
         "name": req.name,
