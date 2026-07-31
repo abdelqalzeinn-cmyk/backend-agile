@@ -248,11 +248,12 @@ async def proxy_post(path: str, request: Request):
             formatted = []
             for t in available:
                 if isinstance(t, dict):
-                    formatted.append({
+                    fn = {
                         "name": t.get("name") or t.get("id"),
                         "description": t.get("description", ""),
                         "parameters": t.get("parameters", {}),
-                    })
+                    }
+                    formatted.append({"type": "function", "function": fn})
             if formatted:
                 body.setdefault("tools", [])
                 # dedupe by name
