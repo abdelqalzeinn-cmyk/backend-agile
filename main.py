@@ -77,7 +77,7 @@ def _proxy_headers() -> dict:
         "user-agent": "AgileBotGateway/0.1 (+https://github.com/abdelqalzeinn-cmyk/backend-agile)",
     }
 
-def _proxy(method: str, path: str, body: dict | None = None, headers: dict | None = None) -> httpx.Response:
+def _proxy(method: str, path: str, body: dict | bytes | None = None, headers: dict | None = None) -> httpx.Response:
     url = f"{UPSTREAM}{path}"
     merged = dict(_proxy_headers())
     if headers:
@@ -85,6 +85,8 @@ def _proxy(method: str, path: str, body: dict | None = None, headers: dict | Non
     with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(60.0, connect=10.0)) as client:
         if method == "GET":
             return client.get(url, headers=merged)
+        if isinstance(body, bytes):
+            return client.request(method, url, content=body, headers=merged)
         return client.request(method, url, json=body, headers=merged)
 
 # ---------- Health ----------
