@@ -16,6 +16,8 @@ import httpx
 UPSTREAM = os.environ.get("AGILEBOT_UPSTREAM", "https://api.agilebot.dev")
 PORT = int(os.environ.get("PORT", "8765"))
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+FREELLMAPI_URL = os.environ.get("FREELLMAPI_URL", "https://freellmapi-cliz.onrender.com")
+FREELLMAPI_KEY = os.environ.get("FREELLMAPI_KEY", "")
 
 app = FastAPI(title="AgileBot Gateway", version="0.2.0")
 
@@ -120,6 +122,12 @@ async def models_gateway(request: Request):
             upstream_models = data.get("models", data) if isinstance(data, dict) else data
     except Exception as e:
         upstream_status = f"error: {e}"
+
+    # Sync FreeLLMAPI models into custom catalog if not already present
+    try:
+        sync_freellmapi_models()
+    except Exception:
+        pass
 
     merged = []
     for m in upstream_models:
@@ -320,6 +328,9 @@ async def proxy_post(path: str, request: Request):
             provider = model.get("provider", "openrouter")
             endpoint = model.get("endpoint", "https://openrouter.ai/api/v1")
 
+            if provider == "freellmapi":
+                return forward_freellmapi(body)
+
             if provider == "openrouter":
                 if not OPENROUTER_KEY:
                     return JSONResponse({"error": "OPENROUTER_API_KEY not set"}, status_code=500)
@@ -423,6 +434,68 @@ def sync_openrouter_free_models():
         "total_free": len(models),
         "sample": [m.get("id") for m in models[:5]],
     }
+
+
+# ---------- FreeLLMAPI forward + model sync ----------
+
+def _freellmapi_headers() -> dict:
+    h = {"Content-Type": "application/json"}
+    if FREELLMAPI_KEY:
+        h["Authorization"] = f"Bearer {FREELLMAPI_KEY}"
+    return h
+
+
+def fetch_freellmapi_models() -> list:
+    if not FREELLMAPI_URL:
+        return []
+    try:
+        with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30.0)) as client:
+            r = client.get(f"{FREELLMAPI_URL.rstrip('/')}/v1/models", headers=_freellmapi_headers())
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            return data.get("data", data) if isinstance(data, dict) else data
+    except Exception:
+        return []
+
+
+def sync_freellmapi_models() -> dict:
+    models = fetch_freellmapi_models()
+    added = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id") or "")
+        if mid == "" or mid in CUSTOM_MODELS:
+            continue
+        CUSTOM_MODELS[mid] = {
+            "id": mid,
+            "name": m.get("name", mid),
+            "provider": "freellmapi",
+            "endpoint": FREELLMAPI_URL,
+            "context_length": m.get("context_length", 8192),
+            "supports_tools": m.get("supports_tools", False),
+            "created_at": time.time(),
+        }
+        added.append(mid)
+    if added:
+        save_json(CUSTOM_MODELS_FILE, CUSTOM_MODELS)
+    return {
+        "added": added,
+        "skipped": [m.get("id") for m in models if isinstance(m, dict) and m.get("id") in CUSTOM_MODELS],
+        "total": len(models),
+        "sample": [m.get("id") for m in models[:5] if isinstance(m, dict)],
+    }
+
+
+def forward_freellmapi(body: dict) -> Response:
+    url = f"{FREELLMAPI_URL.rstrip('/')}/v1/chat/completions"
+    headers = _freellmapi_headers()
+    headers["HTTP-Referer"] = "http://localhost:8765"
+    headers["X-Title"] = "AgileBot Gateway"
+    with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+        r = client.post(url, json=body, headers=headers)
+    return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
 
 
 # ---------- Merged catalog endpoints ----------
