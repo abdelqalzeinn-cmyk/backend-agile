@@ -234,7 +234,7 @@ async def proxy_get(path: str):
 
 @app.post("/{path:path}")
 async def proxy_post(path: str, request: Request):
-    if path == "chat/completions":
+    if path.endswith("chat/completions"):
         body = await request.json()
         model_id = body.get("model", "")
 
