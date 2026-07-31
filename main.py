@@ -69,6 +69,12 @@ def _add_auth(headers: dict, request: Request) -> dict:
         headers["authorization"] = auth
     return headers
 
+def _proxy_headers() -> dict:
+    return {
+        "accept": "application/json",
+        "user-agent": "AgileBotGateway/0.1 (+https://github.com/abdelqalzeinn-cmyk/backend-agile)",
+    }
+
 def _proxy(method: str, path: str, body: dict | None = None, headers: dict | None = None) -> httpx.Response:
     url = f"{UPSTREAM}{path}"
     merged = dict(_proxy_headers())
@@ -343,55 +349,7 @@ def sync_openrouter_free_models():
         "sample": [m.get("id") for m in models[:5]],
     }
 
-# ---------- Admin: custom tools ----------
 
-@app.get("/admin/tools")
-def list_admin_tools():
-    return {"tools": list(CUSTOM_TOOLS.values())}
-
-@app.post("/admin/tools")
-def add_admin_tool(req):
-    CUSTOM_TOOLS[req.name] = {
-        "name": req.name,
-        "description": req.description,
-        "parameters": req.parameters,
-        "handler": req.handler,
-        "created_at": time.time(),
-    }
-    save_json(CUSTOM_TOOLS_FILE, CUSTOM_TOOLS)
-    return {"ok": True, "tool": CUSTOM_TOOLS[req.name]}
-
-@app.delete("/admin/tools/{name}")
-def delete_admin_tool(name: str):
-    if name in CUSTOM_TOOLS:
-        del CUSTOM_TOOLS[name]
-        save_json(CUSTOM_TOOLS_FILE, CUSTOM_TOOLS)
-    return {"ok": True}
-
-# ---------- Admin: custom models ----------
-
-@app.get("/admin/models")
-def list_admin_models():
-    return {"models": list(CUSTOM_MODELS.values())}
-
-@app.post("/admin/models")
-def add_admin_model(req):
-    CUSTOM_MODELS[req.id] = {
-        "id": req.id,
-        "name": req.name,
-        "provider": req.provider,
-        "endpoint": req.endpoint,
-        "context_length": req.context_length,
-        "supports_tools": req.supports_tools,
-        "created_at": time.time(),
-    }
-    save_json(CUSTOM_MODELS_FILE, CUSTOM_MODELS)
-    return {"ok": True, "model": CUSTOM_MODELS[req.id]}
-
-@app.delete("/admin/models/{model_id}")
-def delete_admin_model(model_id: str):
-    if model_id in CUSTOM_MODELS:
-        del CUSTOM_MODELS[model_id]
         save_json(CUSTOM_MODELS_FILE, CUSTOM_MODELS)
     return {"ok": True}
 
