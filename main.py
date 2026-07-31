@@ -271,6 +271,9 @@ async def conversations_post(request: Request):
     a = request.headers.get("authorization") or request.headers.get("Authorization")
     if a:
         h["authorization"] = a
+    ct = request.headers.get("content-type") or request.headers.get("Content-Type")
+    if ct:
+        h["content-type"] = ct
     body = await request.body()
     r = _proxy("POST", "/conversations", body=body, headers=h)
     return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
@@ -291,6 +294,9 @@ async def proxy_post(path: str, request: Request):
     a = request.headers.get("authorization") or request.headers.get("Authorization")
     if a:
         h["authorization"] = a
+    ct = request.headers.get("content-type") or request.headers.get("Content-Type")
+    if ct:
+        h["content-type"] = ct
     if path == "chat/completions":
         body = await request.json()
         model_id = body.get("model", "")
