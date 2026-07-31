@@ -199,6 +199,28 @@ def models_custom_one(model_id: str):
 
 # ---------- Catch-all proxy ----------
 
+
+# ---------- Workspace ----------
+
+@app.get("/workspace")
+async def workspace(request: Request):
+    h = dict(_proxy_headers())
+    a = request.headers.get("authorization") or request.headers.get("Authorization")
+    if a:
+        h["authorization"] = a
+    r = _proxy("GET", "/workspace", headers=h)
+    if r.status_code != 200:
+        return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+    try:
+        data = r.json()
+        ws = data.get("workspace") or {}
+        user = data.get("user") or {}
+        data["username"] = user.get("username") or ws.get("name") or ws.get("slug") or ""
+        return JSONResponse(content=data, status_code=200)
+    except Exception:
+        return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+
+
 @app.get("/{path:path}")
 async def proxy_get(path: str, request: Request):
     h = dict(_proxy_headers())
@@ -474,3 +496,4 @@ if __name__ == "__main__":
     else:
         print("OpenRouter: disabled (set OPENROUTER_API_KEY)")
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
+
