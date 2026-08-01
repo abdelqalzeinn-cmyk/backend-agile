@@ -1024,6 +1024,19 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
             candidates = [real_model]
 
         tools = _build_tools_payload()
+        # If the user is clearly asking for an animation, FORCE the model to call
+        # create_animation (FreeLLMAPI "auto" is unreliable at deciding to use
+        # tools on its own). This guarantees the tool fires with populated args
+        # instead of the model just describing a script.
+        last_user = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user = m.get("content", "") or ""
+                break
+        ANIM_KW = ("animat", "wave", "spin", "dance", "keyframe", "motion", "movement", "create animation")
+        forced_tool = None
+        if any(k in last_user.lower() for k in ANIM_KW) and any(t.get("name") == "create_animation" for t in tools):
+            forced_tool = "create_animation"
         sys_msgs = list(messages)
         if SYSTEM_PROMPT:
             if not sys_msgs or sys_msgs[0].get("role") != "system":
@@ -1054,7 +1067,13 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
                 body = {"model": attempt_model, "messages": sys_msgs, "stream": True}
                 if tools:
                     body["tools"] = tools
-                    body["tool_choice"] = "auto"
+                    if forced_tool and provider == "freellmapi":
+                        # Force the router to emit this specific tool call so the
+                        # animation is actually built instead of just described.
+                        body["tool_choice"] = {"type": "function",
+                                                "function": {"name": forced_tool}}
+                    else:
+                        body["tool_choice"] = "auto"
 
                 with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(connect=10.0, read=25.0, write=30.0, pool=10.0)) as client:
                     with client.stream("POST", url, json=body, headers=headers) as resp:
