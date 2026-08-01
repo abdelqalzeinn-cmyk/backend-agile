@@ -835,6 +835,7 @@ def _handle_custom_conversation(model_id: str, message: str, conversation_id: st
             "name": name,
             "arguments": args,
             "args": args,
+            "conversation_id": conv_id,
             "operation_id": conv_id,
         }
         timeline.append({
