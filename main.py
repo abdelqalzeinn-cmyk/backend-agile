@@ -975,7 +975,7 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
         if provider == "freellmapi":
             # model_id may be "freellmapi/<x>" or a bare synced id; either way
             # the chosen model is the part after the optional "freellmapi/" prefix.
-            chosen = _strip_prefix(model_id, "freellmapi/") or "auto"
+            chosen = _strip_prefix(model_id, "freellmapi") or "auto"
             if chosen == "auto":
                 candidates = ["auto", "deepseek-v4-flash", "qwen3.6-27b",
                               "mistral-small-4", "gpt-oss-20b", "llama-3.3-70b"]
