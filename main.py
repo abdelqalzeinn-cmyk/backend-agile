@@ -474,6 +474,34 @@ def admin_models_sync_freellmapi():
     })
 
 
+@app.get("/conversations/{conversation_id}/timeline")
+def conversations_timeline(conversation_id: str, request: Request):
+    # Local custom-provider conversations live only in our shim, not upstream.
+    # The plugin fetches this after a streamed operation completes to reconcile
+    # the final conversation; without it we 404 and the chat never finalizes.
+    conv = LOCAL_CONVERSATIONS.get(conversation_id)
+    if conv is None:
+        # Not a local conversation — let upstream handle it (native models).
+        h = dict(_proxy_headers())
+        a = request.headers.get("authorization") or request.headers.get("Authorization")
+        if a:
+            h["authorization"] = a
+        r = _proxy("GET", f"/conversations/{conversation_id}/timeline", headers=h)
+        return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
+
+    blocks = []
+    seq = 1
+    for m in conv.get("messages", []):
+        role = m.get("role", "user")
+        blocks.append(_make_block(role, m.get("content", ""), seq))
+        seq += 1
+    return JSONResponse(content={
+        "conversation": {"id": conv.get("id", conversation_id), "name": conv.get("name", "")},
+        "timeline": blocks,
+        "has_more_older": False,
+    })
+
+
 @app.get("/operations/{operation_id}/events")
 def operation_events(operation_id: str, after_seq: int = 0, limit: int = 50):
     with OPERATION_LOCK:
