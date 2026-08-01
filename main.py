@@ -936,12 +936,20 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
         if provider is None:
             raise RuntimeError(f"Unknown custom model provider for '{model_id}'")
 
-        # FreeLLMAPI can be flaky on the 'auto' router; fall back to other
-        # FreeLLMAPI models (NOT OpenRouter) if one fails. OpenRouter stays
-        # single-shot (no fallback) per owner directive.
+        # Resolve the model the user actually picked (so an explicit pick is
+        # tried first), then build a FreeLLMAPI-only fallback chain. OpenRouter
+        # stays single-shot (no fallback) per owner directive.
         if provider == "freellmapi":
-            candidates = ["auto", "deepseek-v4-flash", "qwen3.6-27b",
-                          "mistral-small-4", "gpt-oss-20b", "llama-3.3-70b"]
+            # model_id may be "freellmapi/<x>" or a bare synced id; either way
+            # the chosen model is the part after the optional "freellmapi/" prefix.
+            chosen = _strip_prefix(model_id, "freellmapi/") or "auto"
+            if chosen == "auto":
+                candidates = ["auto", "deepseek-v4-flash", "qwen3.6-27b",
+                              "mistral-small-4", "gpt-oss-20b", "llama-3.3-70b"]
+            else:
+                fallbacks = ["auto", "deepseek-v4-flash", "qwen3.6-27b",
+                             "mistral-small-4", "gpt-oss-20b", "llama-3.3-70b"]
+                candidates = [chosen] + [f for f in fallbacks if f != chosen]
         else:
             candidates = [real_model]
 
