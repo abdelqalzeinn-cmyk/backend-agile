@@ -685,8 +685,44 @@ def _is_custom_model(model_id: str) -> bool:
     return bool(model_id) and (model_id in CUSTOM_MODELS or model_id in CUSTOM_MODEL_ALIASES)
 
 
-def _call_custom_model_sync(model_id: str, messages: list) -> str:
-    """Call the underlying provider directly (non-streaming) and return the assistant text."""
+def _build_tools_payload() -> list:
+    """Build OpenAI-style tool definitions from the gateway catalog."""
+    try:
+        available = list_gateway_tools().get("tools", [])
+    except Exception:
+        return []
+    tools = []
+    seen = set()
+    for t in available:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name") or t.get("id")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        params = t.get("parameters") or {}
+        if not isinstance(params, dict):
+            params = {}
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": t.get("description", ""),
+                "parameters": params if params.get("type") == "object" else {
+                    "type": "object",
+                    "properties": params if isinstance(params, dict) else {},
+                },
+            },
+        })
+    return tools
+
+
+def _call_custom_model_sync(model_id: str, messages: list) -> dict:
+    """Call the underlying provider directly (non-streaming) and return the raw message dict.
+
+    Returns {"content": str, "tool_calls": [{"id", "name", "arguments": dict}]}.
+    Tool calls are surfaced so the backend can emit them as plugin-executable tool_request blocks.
+    """
     provider, endpoint, real_model = None, None, model_id
 
     if model_id in CUSTOM_MODELS:
@@ -718,6 +754,18 @@ def _call_custom_model_sync(model_id: str, messages: list) -> str:
         raise RuntimeError(f"Unknown custom model provider for '{model_id}'")
 
     body = {"model": real_model, "messages": messages}
+    tools = _build_tools_payload()
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    if SYSTEM_PROMPT:
+        msgs = list(messages)
+        if not msgs or msgs[0].get("role") != "system":
+            body["messages"] = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
+        else:
+            msgs[0] = {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + msgs[0].get("content", "")}
+            body["messages"] = msgs
+
     with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(120.0, connect=10.0)) as client:
         r = client.post(url, json=body, headers=headers)
     if r.status_code != 200:
@@ -726,7 +774,20 @@ def _call_custom_model_sync(model_id: str, messages: list) -> str:
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError(f"{provider} returned no choices: {json.dumps(data)[:300]}")
-    return choices[0].get("message", {}).get("content", "") or ""
+    msg = choices[0].get("message", {})
+    content = msg.get("content", "") or ""
+    raw_calls = msg.get("tool_calls") or []
+    tool_calls = []
+    for tc in raw_calls:
+        fn = tc.get("function") or {}
+        name = fn.get("name", "")
+        args_str = fn.get("arguments", "{}") or "{}"
+        try:
+            args = json.loads(args_str) if isinstance(args_str, str) else args_str
+        except Exception:
+            args = {}
+        tool_calls.append({"id": tc.get("id", ""), "name": name, "arguments": args})
+    return {"content": content, "tool_calls": tool_calls}
 
 
 def _make_block(role: str, text: str, seq_n: int) -> dict:
@@ -747,19 +808,49 @@ def _handle_custom_conversation(model_id: str, message: str, conversation_id: st
         LOCAL_CONVERSATIONS[conv_id] = conv
 
     conv["messages"].append({"role": "user", "content": message})
-    reply = _call_custom_model_sync(model_id, conv["messages"])
-    conv["messages"].append({"role": "assistant", "content": reply})
+    resp = _call_custom_model_sync(model_id, conv["messages"])
+    content = resp.get("content", "") or ""
+    tool_calls = resp.get("tool_calls", []) or []
+    conv["messages"].append({"role": "assistant", "content": content})
 
     user_seq, assistant_seq = conv["next_seq"], conv["next_seq"] + 1
     conv["next_seq"] = assistant_seq + 1
     save_json(LOCAL_CONVERSATIONS_FILE, LOCAL_CONVERSATIONS)
 
+    timeline = [
+        _make_block("user", message, user_seq),
+        _make_block("assistant", content, assistant_seq),
+    ]
+
+    # Surface any tool calls the model made as plugin-executable permission blocks.
+    # The plugin auto-allows non-sensitive tools (create_animation) and runs them locally
+    # via its own Tools.createAnimation, so the animation is actually built in Roblox.
+    for tc in tool_calls:
+        name = tc.get("name", "")
+        args = tc.get("arguments", {}) or {}
+        req_id = tc.get("id") or uuid.uuid4().hex
+        tool_request = {
+            "id": req_id,
+            "tool_name": name,
+            "name": name,
+            "arguments": args,
+            "args": args,
+            "operation_id": conv_id,
+        }
+        timeline.append({
+            "render_id": f"tool_request:{req_id}",
+            "id": req_id,
+            "role": "permission",
+            "text": "",
+            "tool_request": tool_request,
+            "tool_request_id": req_id,
+            "operation_id": conv_id,
+            "status": "pending",
+        })
+
     return {
         "conversation": {"id": conv_id, "name": conv["name"]},
-        "timeline": [
-            _make_block("user", message, user_seq),
-            _make_block("assistant", reply, assistant_seq),
-        ],
+        "timeline": timeline,
         "has_more_older": False,
         "status": "completed",
     }
