@@ -69,8 +69,12 @@ BUILTIN_TOOLS = {
         "name": "search_animations",
         "description": "Search Roblox catalog for animations by keyword. Returns asset id, name, creator.",
         "parameters": {
-            "query": "string - search keyword",
-            "category": "string - optional filter (e.g. emote, run, idle)",
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "search keyword"},
+                "category": {"type": "string", "description": "optional filter (e.g. emote, run, idle)"},
+            },
+            "required": ["query"],
         },
         "endpoint": "/roblox-proxy/catalog.roblox.com/v1/search/items/details?Category=12&Subcategory=27&Keyword={query}&Limit=20&SortType=Relevance",
     },
@@ -78,7 +82,11 @@ BUILTIN_TOOLS = {
         "name": "search_sounds",
         "description": "Search Roblox catalog for sounds/audio by keyword.",
         "parameters": {
-            "query": "string - search keyword",
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "search keyword"},
+            },
+            "required": ["query"],
         },
         "endpoint": "/roblox-proxy/apis.roblox.com/toolbox-service/v1/search?query={query}&category=Audio",
     },
