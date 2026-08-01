@@ -403,6 +403,18 @@ async def conversations_messages_post(conversation_id: str, request: Request):
     return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
 
 
+# The plugin POSTs tool execution results here after running a tool locally
+# (e.g. create_animation). We don't need to forward them upstream — the action
+# already happened in Studio — so just acknowledge with 200.
+@app.post("/operations/{operation_id}/tool_results")
+async def operation_tool_results(operation_id: str, request: Request):
+    try:
+        await request.body()
+    except Exception:
+        pass
+    return JSONResponse(content={"ok": True, "operation_id": operation_id}, status_code=200)
+
+
 
 
 @app.post("/admin/system-prompt")
