@@ -454,6 +454,18 @@ async def get_system_prompt():
     }
 
 
+@app.get("/operations/{operation_id}/events")
+def operation_events(operation_id: str, after_seq: int = 0, limit: int = 50):
+    with OPERATION_LOCK:
+        op = OPERATION_EVENTS.get(operation_id)
+        if op is None:
+            return {"operation_id": operation_id, "status": "unknown", "events": []}
+        events = [e for e in op["events"] if e["seq"] > after_seq]
+        if limit and limit > 0:
+            events = events[-limit:]
+        return {"operation_id": operation_id, "status": op["status"], "events": events}
+
+
 @app.get("/{path:path}")
 async def proxy_get(path: str, request: Request):
     h = dict(_proxy_headers())
@@ -924,62 +936,91 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
         if provider is None:
             raise RuntimeError(f"Unknown custom model provider for '{model_id}'")
 
-        if provider == "openrouter":
-            if not OPENROUTER_KEY:
-                raise RuntimeError("OPENROUTER_API_KEY not set on the backend")
-            url = f"{(endpoint or OPENROUTER_API_URL).rstrip('/')}/chat/completions"
-            headers = {"content-type": "application/json",
-                       "authorization": f"Bearer {OPENROUTER_KEY}",
-                       "http-referer": "http://localhost:8765", "x-title": "AgileBot Gateway"}
-        else:  # freellmapi
-            url = f"{FREELLMAPI_URL.rstrip('/')}/v1/chat/completions"
-            headers = _freellmapi_headers()
-            headers["HTTP-Referer"] = "http://localhost:8765"
-            headers["X-Title"] = "AgileBot Gateway"
+        # FreeLLMAPI can be flaky on the 'auto' router; fall back to other
+        # FreeLLMAPI models (NOT OpenRouter) if one fails. OpenRouter stays
+        # single-shot (no fallback) per owner directive.
+        if provider == "freellmapi":
+            candidates = ["auto", "deepseek-v4-flash", "qwen3.6-27b",
+                          "mistral-small-4", "gpt-oss-20b", "llama-3.3-70b"]
+        else:
+            candidates = [real_model]
 
-        body = {"model": real_model, "messages": messages, "stream": True}
         tools = _build_tools_payload()
-        if tools:
-            body["tools"] = tools
-            body["tool_choice"] = "auto"
+        sys_msgs = list(messages)
         if SYSTEM_PROMPT:
-            msgs = list(messages)
-            if not msgs or msgs[0].get("role") != "system":
-                body["messages"] = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
+            if not sys_msgs or sys_msgs[0].get("role") != "system":
+                sys_msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + sys_msgs
             else:
-                msgs[0] = {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + msgs[0].get("content", "")}
-                body["messages"] = msgs
+                sys_msgs[0] = {"role": "system",
+                               "content": SYSTEM_PROMPT + "\n\n" + sys_msgs[0].get("content", "")}
 
-        with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(180.0, connect=10.0)) as client:
-            with client.stream("POST", url, json=body, headers=headers) as resp:
-                if resp.status_code != 200:
-                    raise RuntimeError(f"{provider} stream error {resp.status_code}: {resp.read().decode()[:300]}")
-                for chunk in resp.iter_lines():
-                    for data in _parse_sse_lines(chunk):
-                        try:
-                            piece = json.loads(data)
-                        except Exception:
-                            continue
-                        # OpenAI-style delta
-                        delta = (piece.get("choices") or [{}])[0].get("delta") or {}
-                        text_delta = delta.get("content") or ""
-                        if text_delta:
-                            acc += text_delta
-                            _op_emit(operation_id, "block_patch", {
-                                "block_id": render_id,
-                                "patch": {"text_append": text_delta},
-                            })
-                        # capture tool calls if the model emits them mid-stream
-                        for tc in delta.get("tool_calls") or []:
-                            idx = tc.get("index", 0)
-                            while len(tool_calls_acc) <= idx:
-                                tool_calls_acc.append({"id": "", "name": "", "arguments": ""})
-                            if tc.get("id"):
-                                tool_calls_acc[idx]["id"] = tc["id"]
-                            if tc.get("function", {}).get("name"):
-                                tool_calls_acc[idx]["name"] = tc["function"]["name"]
-                            if tc.get("function", {}).get("arguments"):
-                                tool_calls_acc[idx]["arguments"] += tc["function"]["arguments"]
+        last_err = None
+        for attempt_model in candidates:
+            if attempt_model != candidates[0]:
+                # brief pause before retrying a different model
+                time.sleep(0.4)
+            try:
+                if provider == "openrouter":
+                    if not OPENROUTER_KEY:
+                        raise RuntimeError("OPENROUTER_API_KEY not set on the backend")
+                    url = f"{(endpoint or OPENROUTER_API_URL).rstrip('/')}/chat/completions"
+                    headers = {"content-type": "application/json",
+                               "authorization": f"Bearer {OPENROUTER_KEY}",
+                               "http-referer": "http://localhost:8765", "x-title": "AgileBot Gateway"}
+                else:  # freellmapi
+                    url = f"{FREELLMAPI_URL.rstrip('/')}/v1/chat/completions"
+                    headers = _freellmapi_headers()
+                    headers["HTTP-Referer"] = "http://localhost:8765"
+                    headers["X-Title"] = "AgileBot Gateway"
+
+                body = {"model": attempt_model, "messages": sys_msgs, "stream": True}
+                if tools:
+                    body["tools"] = tools
+                    body["tool_choice"] = "auto"
+
+                with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(180.0, connect=10.0)) as client:
+                    with client.stream("POST", url, json=body, headers=headers) as resp:
+                        if resp.status_code != 200:
+                            raise RuntimeError(
+                                f"{provider}:{attempt_model} stream error {resp.status_code}: {resp.read().decode()[:200]}")
+                        got_any = False
+                        for chunk in resp.iter_lines():
+                            for data in _parse_sse_lines(chunk):
+                                try:
+                                    piece = json.loads(data)
+                                except Exception:
+                                    continue
+                                delta = (piece.get("choices") or [{}])[0].get("delta") or {}
+                                text_delta = delta.get("content") or ""
+                                if text_delta:
+                                    got_any = True
+                                    acc += text_delta
+                                    _op_emit(operation_id, "block_patch", {
+                                        "block_id": render_id,
+                                        "patch": {"text_append": text_delta},
+                                    })
+                                for tc in delta.get("tool_calls") or []:
+                                    idx = tc.get("index", 0)
+                                    while len(tool_calls_acc) <= idx:
+                                        tool_calls_acc.append({"id": "", "name": "", "arguments": ""})
+                                    if tc.get("id"):
+                                        tool_calls_acc[idx]["id"] = tc["id"]
+                                    if tc.get("function", {}).get("name"):
+                                        tool_calls_acc[idx]["name"] = tc["function"]["name"]
+                                    if tc.get("function", {}).get("arguments"):
+                                        tool_calls_acc[idx]["arguments"] += tc["function"]["arguments"]
+                        if not got_any:
+                            raise RuntimeError(f"{provider}:{attempt_model} returned no content")
+                break  # success — stop trying further candidates
+            except Exception as e:
+                last_err = e
+                # reset partial accumulation so a failed attempt doesn't bleed
+                # into the next candidate's text
+                acc = ""
+                continue
+        else:
+            # none of the candidates worked
+            raise last_err or RuntimeError("all FreeLLMAPI candidates failed")
 
         # finalize the assistant block
         _op_emit(operation_id, "block_patch", {
@@ -1052,19 +1093,6 @@ def _handle_custom_conversation(model_id: str, message: str, conversation_id: st
         "timeline": [_make_block("user", message, user_seq)],
         "has_more_older": False,
     }
-
-
-@app.get("/operations/{operation_id}/events")
-def operation_events(operation_id: str, after_seq: int = 0, limit: int = 50):
-    with OPERATION_LOCK:
-        op = OPERATION_EVENTS.get(operation_id)
-        if op is None:
-            return {"operation_id": operation_id, "status": "unknown", "events": []}
-        events = [e for e in op["events"] if e["seq"] > after_seq]
-        if limit and limit > 0:
-            events = events[-limit:]
-        return {"operation_id": operation_id, "status": op["status"], "events": events}
-
 
 
 # ---------- Merged catalog endpoints ----------
