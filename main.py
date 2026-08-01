@@ -8,6 +8,7 @@ import os
 import json
 import time
 import uuid
+import threading
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -57,6 +58,14 @@ SYSTEM_PROMPT: str = load_system_prompt()
 
 LOCAL_CONVERSATIONS_FILE = DATA_DIR / "local_conversations.json"
 LOCAL_CONVERSATIONS: dict = load_json(LOCAL_CONVERSATIONS_FILE, {})
+
+# Streaming operation store. The plugin polls GET /operations/{op}/events and
+# expects a rolling list of {seq, type, payload} events plus a terminal status.
+# type "block_upsert" -> payload.block (full block, streaming=true)
+# type "block_patch"  -> payload.{block_id, patch:{text=delta}} (append) or
+#                         payload.{block_id, patch:{streaming=false, text=full}}
+OPERATION_EVENTS: dict = {}
+OPERATION_LOCK = threading.Lock()
 
 # Aliases that aren't in CUSTOM_MODELS but should still bypass the upstream
 # (api.agilebot.dev) conversation validator, which has no idea what these are.
@@ -841,6 +850,175 @@ def _make_block(role: str, text: str, seq_n: int) -> dict:
     }
 
 
+def _op_emit(operation_id: str, event_type: str, payload: dict):
+    """Append one event to an operation's rolling event log (thread-safe)."""
+    with OPERATION_LOCK:
+        op = OPERATION_EVENTS.get(operation_id)
+        if op is None:
+            op = {"status": "running", "events": [], "seq": 0}
+            OPERATION_EVENTS[operation_id] = op
+        op["seq"] += 1
+        op["events"].append({"seq": op["seq"], "type": event_type, "payload": payload})
+
+
+def _op_finish(operation_id: str, status: str = "completed"):
+    with OPERATION_LOCK:
+        op = OPERATION_EVENTS.get(operation_id)
+        if op is None:
+            op = {"status": "running", "events": [], "seq": 0}
+            OPERATION_EVENTS[operation_id] = op
+        op["status"] = status
+
+
+def _parse_sse_lines(raw: str):
+    """Yield data payloads from an SSE byte stream (lines prefixed 'data:')."""
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            return
+        yield data
+
+
+def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_id: str,
+                         assistant_seq: int, tool_calls_acc: list):
+    """Background worker: call the provider with stream:true, push block events
+    to the operation store so the plugin renders live typing."""
+    render_id = f"message:{uuid.uuid4().hex}"
+    # 1) upsert the assistant block in 'streaming' state
+    _op_emit(operation_id, "block_upsert", {
+        "block": {
+            "render_id": render_id,
+            "id": render_id,
+            "role": "assistant",
+            "text": "",
+            "seq": assistant_seq,
+            "created_at_unix_ms": int(time.time() * 1000),
+            "streaming": True,
+        }
+    })
+
+    acc = ""
+    try:
+        provider, endpoint, real_model = None, None, model_id
+        if model_id in CUSTOM_MODELS:
+            m = CUSTOM_MODELS[model_id]
+            provider = m.get("provider", "openrouter")
+            endpoint = m.get("endpoint")
+        elif model_id == "openrouter/auto":
+            provider, endpoint, real_model = "openrouter", OPENROUTER_API_URL, "openrouter/auto"
+        elif model_id.startswith("freellmapi/"):
+            provider, real_model = "freellmapi", "auto"
+        else:
+            for pfx in ("freellmapi/", "openrouter/"):
+                cand = _strip_prefix(model_id, pfx)
+                if cand in CUSTOM_MODELS:
+                    m = CUSTOM_MODELS[cand]
+                    provider = m.get("provider", "openrouter")
+                    endpoint = m.get("endpoint")
+                    if provider == "freellmapi":
+                        real_model = "auto"
+                    break
+        if provider is None:
+            raise RuntimeError(f"Unknown custom model provider for '{model_id}'")
+
+        if provider == "openrouter":
+            if not OPENROUTER_KEY:
+                raise RuntimeError("OPENROUTER_API_KEY not set on the backend")
+            url = f"{(endpoint or OPENROUTER_API_URL).rstrip('/')}/chat/completions"
+            headers = {"content-type": "application/json",
+                       "authorization": f"Bearer {OPENROUTER_KEY}",
+                       "http-referer": "http://localhost:8765", "x-title": "AgileBot Gateway"}
+        else:  # freellmapi
+            url = f"{FREELLMAPI_URL.rstrip('/')}/v1/chat/completions"
+            headers = _freellmapi_headers()
+            headers["HTTP-Referer"] = "http://localhost:8765"
+            headers["X-Title"] = "AgileBot Gateway"
+
+        body = {"model": real_model, "messages": messages, "stream": True}
+        tools = _build_tools_payload()
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        if SYSTEM_PROMPT:
+            msgs = list(messages)
+            if not msgs or msgs[0].get("role") != "system":
+                body["messages"] = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
+            else:
+                msgs[0] = {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + msgs[0].get("content", "")}
+                body["messages"] = msgs
+
+        with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(180.0, connect=10.0)) as client:
+            with client.stream("POST", url, json=body, headers=headers) as resp:
+                if resp.status_code != 200:
+                    raise RuntimeError(f"{provider} stream error {resp.status_code}: {resp.read().decode()[:300]}")
+                for chunk in resp.iter_lines():
+                    for data in _parse_sse_lines(chunk):
+                        try:
+                            piece = json.loads(data)
+                        except Exception:
+                            continue
+                        # OpenAI-style delta
+                        delta = (piece.get("choices") or [{}])[0].get("delta") or {}
+                        text_delta = delta.get("content") or ""
+                        if text_delta:
+                            acc += text_delta
+                            _op_emit(operation_id, "block_patch", {
+                                "block_id": render_id,
+                                "patch": {"text_append": text_delta},
+                            })
+                        # capture tool calls if the model emits them mid-stream
+                        for tc in delta.get("tool_calls") or []:
+                            idx = tc.get("index", 0)
+                            while len(tool_calls_acc) <= idx:
+                                tool_calls_acc.append({"id": "", "name": "", "arguments": ""})
+                            if tc.get("id"):
+                                tool_calls_acc[idx]["id"] = tc["id"]
+                            if tc.get("function", {}).get("name"):
+                                tool_calls_acc[idx]["name"] = tc["function"]["name"]
+                            if tc.get("function", {}).get("arguments"):
+                                tool_calls_acc[idx]["arguments"] += tc["function"]["arguments"]
+
+        # finalize the assistant block
+        _op_emit(operation_id, "block_patch", {
+            "block_id": render_id,
+            "patch": {"streaming": False, "text": acc},
+        })
+        _op_finish(operation_id, "completed")
+
+        # persist + surface tool calls as permission blocks (plugin runs them locally)
+        conv = LOCAL_CONVERSATIONS.get(conv_id)
+        if conv is not None:
+            conv["messages"].append({"role": "assistant", "content": acc})
+            save_json(LOCAL_CONVERSATIONS_FILE, LOCAL_CONVERSATIONS)
+        parsed_calls = []
+        for tc in tool_calls_acc:
+            if not tc.get("name"):
+                continue
+            try:
+                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+            except Exception:
+                args = {}
+            parsed_calls.append({"id": tc.get("id") or uuid.uuid4().hex, "name": tc["name"], "arguments": args})
+        for tc in parsed_calls:
+            req_id = tc["id"]
+            tool_request = {"id": req_id, "tool_name": tc["name"], "name": tc["name"],
+                            "arguments": tc["arguments"], "args": tc["arguments"],
+                            "conversation_id": conv_id, "operation_id": conv_id}
+            _op_emit(operation_id, "block_upsert", {"block": {
+                "render_id": f"tool_request:{req_id}", "id": req_id, "role": "permission",
+                "text": "", "tool_request": tool_request, "tool_request_id": req_id,
+                "operation_id": conv_id, "status": "pending"}})
+    except Exception as e:
+        _op_emit(operation_id, "block_patch", {
+            "block_id": render_id,
+            "patch": {"streaming": False, "text": f"[error] {e}"},
+        })
+        _op_finish(operation_id, "completed")
+
+
 def _handle_custom_conversation(model_id: str, message: str, conversation_id: str | None) -> dict:
     conv_id = conversation_id or uuid.uuid4().hex
     conv = LOCAL_CONVERSATIONS.get(conv_id)
@@ -849,53 +1027,44 @@ def _handle_custom_conversation(model_id: str, message: str, conversation_id: st
         LOCAL_CONVERSATIONS[conv_id] = conv
 
     conv["messages"].append({"role": "user", "content": message})
-    resp = _call_custom_model_sync(model_id, conv["messages"])
-    content = resp.get("content", "") or ""
-    tool_calls = resp.get("tool_calls", []) or []
-    conv["messages"].append({"role": "assistant", "content": content})
-
     user_seq, assistant_seq = conv["next_seq"], conv["next_seq"] + 1
     conv["next_seq"] = assistant_seq + 1
     save_json(LOCAL_CONVERSATIONS_FILE, LOCAL_CONVERSATIONS)
 
-    timeline = [
-        _make_block("user", message, user_seq),
-        _make_block("assistant", content, assistant_seq),
-    ]
+    operation_id = uuid.uuid4().hex
+    # seed the operation store
+    with OPERATION_LOCK:
+        OPERATION_EVENTS[operation_id] = {"status": "running", "events": [], "seq": 0}
 
-    # Surface any tool calls the model made as plugin-executable permission blocks.
-    # The plugin auto-allows non-sensitive tools (create_animation) and runs them locally
-    # via its own Tools.createAnimation, so the animation is actually built in Roblox.
-    for tc in tool_calls:
-        name = tc.get("name", "")
-        args = tc.get("arguments", {}) or {}
-        req_id = tc.get("id") or uuid.uuid4().hex
-        tool_request = {
-            "id": req_id,
-            "tool_name": name,
-            "name": name,
-            "arguments": args,
-            "args": args,
-            "conversation_id": conv_id,
-            "operation_id": conv_id,
-        }
-        timeline.append({
-            "render_id": f"tool_request:{req_id}",
-            "id": req_id,
-            "role": "permission",
-            "text": "",
-            "tool_request": tool_request,
-            "tool_request_id": req_id,
-            "operation_id": conv_id,
-            "status": "pending",
-        })
+    tool_calls_acc: list = []
+    t = threading.Thread(
+        target=_stream_custom_model,
+        args=(operation_id, model_id, conv["messages"], conv_id, assistant_seq, tool_calls_acc),
+        daemon=True,
+    )
+    t.start()
 
+    # Return "running" so the plugin begins polling /operations/{op}/events.
     return {
+        "status": "running",
+        "operation_id": operation_id,
         "conversation": {"id": conv_id, "name": conv["name"]},
-        "timeline": timeline,
+        "timeline": [_make_block("user", message, user_seq)],
         "has_more_older": False,
-        "status": "completed",
     }
+
+
+@app.get("/operations/{operation_id}/events")
+def operation_events(operation_id: str, after_seq: int = 0, limit: int = 50):
+    with OPERATION_LOCK:
+        op = OPERATION_EVENTS.get(operation_id)
+        if op is None:
+            return {"operation_id": operation_id, "status": "unknown", "events": []}
+        events = [e for e in op["events"] if e["seq"] > after_seq]
+        if limit and limit > 0:
+            events = events[-limit:]
+        return {"operation_id": operation_id, "status": op["status"], "events": events}
+
 
 
 # ---------- Merged catalog endpoints ----------
