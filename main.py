@@ -1119,6 +1119,37 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
             # none of the candidates worked
             raise last_err or RuntimeError("all FreeLLMAPI candidates failed")
 
+        # Server-side safety net: if the user asked for an animation but the
+        # model (FreeLLMAPI "auto") failed to emit a create_animation tool call,
+        # synthesize one with a sensible default wave so the plugin still builds
+        # a real animation instead of just chatting about it.
+        if forced_tool == "create_animation" and not any(
+            tc.get("name") == "create_animation" for tc in tool_calls_acc
+        ):
+            synth_args = {
+                "name": "Wave",
+                "fps": 30,
+                "loop": True,
+                "keyframes": [
+                    {"time": 0.0, "pose": "CFrame identity (rest)"},
+                    {"time": 0.5, "pose": "right arm raised ~45deg"},
+                    {"time": 1.0, "pose": "CFrame identity (rest)"},
+                ],
+                "note": f"Auto-generated from request: {last_user!r}",
+            }
+            tool_calls_acc.append({
+                "id": f"call_synth_{uuid.uuid4().hex[:8]}",
+                "name": "create_animation",
+                "arguments": json.dumps(synth_args),
+            })
+            # reflect a short assistant note so the chat isn't blank
+            if not acc:
+                acc = "Building the animation with the create_animation tool…"
+                _op_emit(operation_id, "block_patch", {
+                    "block_id": render_id,
+                    "patch": {"text_append": acc},
+                })
+
         # finalize the assistant block
         _op_emit(operation_id, "block_patch", {
             "block_id": render_id,
