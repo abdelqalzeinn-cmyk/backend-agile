@@ -17,6 +17,7 @@ import httpx
 UPSTREAM = os.environ.get("AGILEBOT_UPSTREAM", "https://api.agilebot.dev")
 PORT = int(os.environ.get("PORT", "8765"))
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+BUILD_TAG = "build-2026-08-01-createanim-synth-v3"
 FREELLMAPI_URL = os.environ.get("FREELLMAPI_URL", "https://freellmapi-cliz.onrender.com")
 FREELLMAPI_KEY = os.environ.get("FREELLMAPI_KEY", "")
 
@@ -188,6 +189,7 @@ def health():
     return {
         "ok": True,
         "upstream": UPSTREAM,
+        "build_tag": BUILD_TAG,
         "custom_models": len(CUSTOM_MODELS),
         "custom_tools": len(CUSTOM_TOOLS),
     }
