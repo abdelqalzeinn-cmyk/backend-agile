@@ -986,7 +986,7 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
                     body["tools"] = tools
                     body["tool_choice"] = "auto"
 
-                with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(180.0, connect=10.0)) as client:
+                with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(connect=10.0, read=25.0, write=30.0, pool=10.0)) as client:
                     with client.stream("POST", url, json=body, headers=headers) as resp:
                         if resp.status_code != 200:
                             raise RuntimeError(
