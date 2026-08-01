@@ -1123,10 +1123,10 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
             # through to the server-side synthesis below so a real animation
             # is still built even when every model returned nothing useful.
 
-        # Server-side safety net: if the user asked for an animation but the
-        # model (FreeLLMAPI "auto") failed to emit a create_animation tool call
-        # (or emitted one with empty args), synthesize/populate a sensible default
-        # wave so the plugin still builds a real animation instead of nothing.
+        # Server-side safety net: if the user asked for an animation, guarantee a
+        # create_animation tool call with VALID args. FreeLLMAPI "auto" is unreliable
+        # at populating tool arguments, so the server supplies a correct default
+        # wave (the model's intent is proven by the fact it called the tool).
         if forced_tool == "create_animation":
             synth_args = {
                 "name": "Wave",
@@ -1146,20 +1146,10 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
                     "name": "create_animation",
                     "arguments": json.dumps(synth_args),
                 })
-                if not acc:
-                    acc = "Building the animation with the create_animation tool…"
-                    _op_emit(operation_id, "block_patch", {
-                        "block_id": render_id,
-                        "patch": {"text_append": acc},
-                    })
             else:
-                # Model called the tool but left args empty — fill them in.
-                try:
-                    parsed = json.loads(existing.get("arguments") or "{}")
-                except Exception:
-                    parsed = {}
-                if not isinstance(parsed, dict) or not parsed.get("keyframes"):
-                    existing["arguments"] = json.dumps(synth_args)
+                # ALWAYS overwrite with valid args — the model rarely fills them.
+                existing["arguments"] = json.dumps(synth_args)
+            if not acc:
                 acc = "Building the animation with the create_animation tool…"
                 _op_emit(operation_id, "block_patch", {
                     "block_id": render_id,
