@@ -39,6 +39,13 @@ def save_json(path: Path, data):
 CUSTOM_TOOLS: dict = load_json(CUSTOM_TOOLS_FILE, {})
 CUSTOM_MODELS: dict = load_json(CUSTOM_MODELS_FILE, {})
 
+LOCAL_CONVERSATIONS_FILE = DATA_DIR / "local_conversations.json"
+LOCAL_CONVERSATIONS: dict = load_json(LOCAL_CONVERSATIONS_FILE, {})
+
+# Aliases that aren't in CUSTOM_MODELS but should still bypass the upstream
+# (api.agilebot.dev) conversation validator, which has no idea what these are.
+CUSTOM_MODEL_ALIASES = {"openrouter/auto", "freellmapi/auto"}
+
 # ---------- Built-in tools ----------
 
 BUILTIN_TOOLS = {
@@ -74,8 +81,14 @@ def _add_auth(headers: dict, request: Request) -> dict:
 def _proxy_headers() -> dict:
     return {
         "accept": "application/json",
+        "accept-encoding": "identity",
         "user-agent": "AgileBotGateway/0.1 (+https://github.com/abdelqalzeinn-cmyk/backend-agile)",
     }
+
+_HOP_BY_HOP = {"content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "upgrade"}
+
+def _clean_response_headers(headers: dict) -> dict:
+    return {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
 
 def _proxy(method: str, path: str, body: dict | bytes | None = None, headers: dict | None = None) -> httpx.Response:
     url = f"{UPSTREAM}{path}"
@@ -125,7 +138,11 @@ async def models_gateway(request: Request):
     except Exception as e:
         upstream_status = f"error: {e}"
 
-    # Sync FreeLLMAPI models into custom catalog if not already present
+    # Sync OpenRouter free models + FreeLLMAPI models into custom catalog if not already present
+    try:
+        sync_openrouter_free_models()
+    except Exception:
+        pass
     try:
         sync_freellmapi_models()
     except Exception:
@@ -257,12 +274,12 @@ async def conversations(request: Request):
         h["authorization"] = a
     r = _proxy("GET", "/conversations", headers=h)
     if r.status_code != 200:
-        return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+        return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
     try:
         data = r.json()
         return JSONResponse(content=data, status_code=200, headers={"Content-Encoding": "identity"})
     except Exception:
-        return Response(content=r.content, status_code=r.status_code, headers={"Content-Encoding": "identity"})
+        return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
 
 
 @app.post("/conversations")
@@ -275,8 +292,54 @@ async def conversations_post(request: Request):
     if ct:
         h["content-type"] = ct
     body = await request.body()
+
+    # Custom-provider models (freellmapi/auto, openrouter/auto, synced OpenRouter
+    # free models, ...) don't exist upstream, so api.agilebot.dev rejects them
+    # with 422 model_unavailable. Handle these entirely locally instead.
+    try:
+        body_json = json.loads(body) if body else {}
+    except Exception:
+        body_json = {}
+    model_id = str(body_json.get("model", ""))
+    if _is_custom_model(model_id):
+        try:
+            result = _handle_custom_conversation(model_id, body_json.get("message", ""), None)
+            return JSONResponse(content=result, status_code=200)
+        except Exception as e:
+            return JSONResponse({"detail": {"code": "custom_model_error", "model": model_id, "message": str(e)}}, status_code=502)
+
     r = _proxy("POST", "/conversations", body=body, headers=h)
-    return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+    return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
+
+
+@app.post("/conversations/{conversation_id}/messages")
+async def conversations_messages_post(conversation_id: str, request: Request):
+    h = dict(_proxy_headers())
+    a = request.headers.get("authorization") or request.headers.get("Authorization")
+    if a:
+        h["authorization"] = a
+    ct = request.headers.get("content-type") or request.headers.get("Content-Type")
+    if ct:
+        h["content-type"] = ct
+    body = await request.body()
+
+    try:
+        body_json = json.loads(body) if body else {}
+    except Exception:
+        body_json = {}
+    model_id = str(body_json.get("model", ""))
+
+    # Route to the local shim if this is a custom model OR this conversation
+    # was already started locally (so follow-ups stay on the same path).
+    if _is_custom_model(model_id) or conversation_id in LOCAL_CONVERSATIONS:
+        try:
+            result = _handle_custom_conversation(model_id, body_json.get("message", ""), conversation_id)
+            return JSONResponse(content=result, status_code=200)
+        except Exception as e:
+            return JSONResponse({"detail": {"code": "custom_model_error", "model": model_id, "message": str(e)}}, status_code=502)
+
+    r = _proxy("POST", f"/conversations/{conversation_id}/messages", body=body, headers=h)
+    return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
 
 
 @app.get("/{path:path}")
@@ -286,7 +349,7 @@ async def proxy_get(path: str, request: Request):
     if a:
         h["authorization"] = a
     r = _proxy("GET", f"/{path}", headers=h)
-    return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+    return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
 
 @app.post("/{path:path}")
 async def proxy_post(path: str, request: Request):
@@ -322,14 +385,10 @@ async def proxy_post(path: str, request: Request):
                 existing = {t.get("name") for t in body["tools"] if isinstance(t, dict)}
                 for t in formatted:
                     if t["name"] not in existing:
-                        body["tools"].append(t)
-                # lightweight system hint unless one already set
-                msgs = body.get("messages") or []
-                hint = "You may use gateway tools:" + ", ".join(t["name"] for t in formatted)
-                if not any(isinstance(m, dict) and m.get("role") == "system" for m in msgs):
-                    msgs = [{"role": "system", "content": hint}] + msgs
-                    body["messages"] = msgs
-
+                        body["tools"].append({
+                            "type": "function",
+                            "function": t,
+                        })
         # Route custom models to their provider
         if model_id in CUSTOM_MODELS:
             model = CUSTOM_MODELS[model_id]
@@ -351,16 +410,11 @@ async def proxy_post(path: str, request: Request):
 
         # Not a custom model — proxy to upstream
         r = _proxy("POST", f"/{path}", body=body, headers=_add_auth(dict(_proxy_headers()), request))
-        return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
-
-    # Default: proxy everything else
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    h = dict(_proxy_headers())
-    r = _proxy("POST", f"/{path}", body=body, headers=_add_auth(h, request))
-    return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+        return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
+    else:
+        body = await request.body()
+    r = _proxy("POST", f"/{path}", body=body, headers=h)
+    return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
 
 # ---------- OpenRouter forward ----------
 
@@ -501,9 +555,110 @@ def forward_freellmapi(body: dict) -> Response:
     headers = _freellmapi_headers()
     headers["HTTP-Referer"] = "http://localhost:8765"
     headers["X-Title"] = "AgileBot Gateway"
+    # FreeLLMAPI's own API doesn't know the "freellmapi/" bookkeeping prefix
+    # AgileBot puts on the model id -- strip it before forwarding.
+    fixed_body = dict(body)
+    fixed_body["model"] = _strip_prefix(str(body.get("model", "")), "freellmapi")
+    with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+        r = client.post(url, json=fixed_body, headers=headers)
+    return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+
+
+# ---------- Local conversation shim for custom-provider models ----------
+# api.agilebot.dev's /conversations endpoint validates "model" against its own
+# native catalog and rejects anything it doesn't recognize (422 model_unavailable).
+# For custom-provider models (freellmapi/auto, openrouter/auto, synced OpenRouter
+# free models) we never forward the conversation to upstream at all -- we run the
+# whole turn locally and hand the client back a response shaped like the one
+# AgileBot's UI already knows how to render (conversation + timeline blocks).
+
+def _strip_prefix(model_id: str, provider_prefix: str) -> str:
+    p = provider_prefix + "/"
+    return model_id[len(p):] if model_id.startswith(p) else model_id
+
+
+def _is_custom_model(model_id: str) -> bool:
+    return bool(model_id) and (model_id in CUSTOM_MODELS or model_id in CUSTOM_MODEL_ALIASES)
+
+
+def _call_custom_model_sync(model_id: str, messages: list) -> str:
+    """Call the underlying provider directly (non-streaming) and return the assistant text."""
+    provider, endpoint, real_model = None, None, model_id
+
+    if model_id in CUSTOM_MODELS:
+        m = CUSTOM_MODELS[model_id]
+        provider = m.get("provider", "openrouter")
+        endpoint = m.get("endpoint")
+    elif model_id == "openrouter/auto":
+        provider, endpoint, real_model = "openrouter", OPENROUTER_API_URL, "openrouter/auto"
+    elif model_id == "freellmapi/auto":
+        provider, real_model = "freellmapi", "auto"
+
+    if provider == "openrouter":
+        if not OPENROUTER_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY not set on the backend")
+        url = f"{(endpoint or OPENROUTER_API_URL).rstrip('/')}/chat/completions"
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {OPENROUTER_KEY}",
+            "http-referer": "http://localhost:8765",
+            "x-title": "AgileBot Gateway",
+        }
+    elif provider == "freellmapi":
+        real_model = _strip_prefix(real_model, "freellmapi")
+        url = f"{FREELLMAPI_URL.rstrip('/')}/v1/chat/completions"
+        headers = _freellmapi_headers()
+        headers["HTTP-Referer"] = "http://localhost:8765"
+        headers["X-Title"] = "AgileBot Gateway"
+    else:
+        raise RuntimeError(f"Unknown custom model provider for '{model_id}'")
+
+    body = {"model": real_model, "messages": messages}
     with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(120.0, connect=10.0)) as client:
         r = client.post(url, json=body, headers=headers)
-    return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+    if r.status_code != 200:
+        raise RuntimeError(f"{provider} error {r.status_code}: {r.text[:500]}")
+    data = r.json()
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"{provider} returned no choices: {json.dumps(data)[:300]}")
+    return choices[0].get("message", {}).get("content", "") or ""
+
+
+def _make_block(role: str, text: str, seq_n: int) -> dict:
+    return {
+        "id": f"message:{uuid.uuid4().hex}",
+        "role": role,
+        "text": text,
+        "seq": seq_n,
+        "created_at_unix_ms": int(time.time() * 1000),
+    }
+
+
+def _handle_custom_conversation(model_id: str, message: str, conversation_id: str | None) -> dict:
+    conv_id = conversation_id or uuid.uuid4().hex
+    conv = LOCAL_CONVERSATIONS.get(conv_id)
+    if conv is None:
+        conv = {"id": conv_id, "name": (message or "New Chat")[:40], "messages": [], "next_seq": 1}
+        LOCAL_CONVERSATIONS[conv_id] = conv
+
+    conv["messages"].append({"role": "user", "content": message})
+    reply = _call_custom_model_sync(model_id, conv["messages"])
+    conv["messages"].append({"role": "assistant", "content": reply})
+
+    user_seq, assistant_seq = conv["next_seq"], conv["next_seq"] + 1
+    conv["next_seq"] = assistant_seq + 1
+    save_json(LOCAL_CONVERSATIONS_FILE, LOCAL_CONVERSATIONS)
+
+    return {
+        "conversation": {"id": conv_id, "name": conv["name"]},
+        "timeline": [
+            _make_block("user", message, user_seq),
+            _make_block("assistant", reply, assistant_seq),
+        ],
+        "has_more_older": False,
+        "status": "completed",
+    }
 
 
 # ---------- Merged catalog endpoints ----------
