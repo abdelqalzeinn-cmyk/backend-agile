@@ -1117,7 +1117,11 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
                 continue
         else:
             # none of the candidates worked
-            raise last_err or RuntimeError("all FreeLLMAPI candidates failed")
+            if not forced_tool:
+                raise last_err or RuntimeError("all FreeLLMAPI candidates failed")
+            # If we're forcing a tool (animation request), don't abort — fall
+            # through to the server-side synthesis below so a real animation
+            # is still built even when every model returned nothing useful.
 
         # Server-side safety net: if the user asked for an animation but the
         # model (FreeLLMAPI "auto") failed to emit a create_animation tool call,
