@@ -56,7 +56,7 @@ BUILTIN_TOOLS = {
             "query": "string - search keyword",
             "category": "string - optional filter (e.g. emote, run, idle)",
         },
-        "endpoint": "/roblox-proxy/apis.roblox.com/toolbox-service/v1/search?query={query}&category=Animation",
+        "endpoint": "/roblox-proxy/catalog.roblox.com/v1/search/items/details?Category=12&Subcategory=27&Keyword={query}&Limit=20&SortType=Relevance",
     },
     "search_sounds": {
         "name": "search_sounds",
@@ -65,6 +65,43 @@ BUILTIN_TOOLS = {
             "query": "string - search keyword",
         },
         "endpoint": "/roblox-proxy/apis.roblox.com/toolbox-service/v1/search?query={query}&category=Audio",
+    },
+    "create_animation": {
+        "name": "create_animation",
+        "description": "Build and play a Roblox KeyframeSequence animation on a target instance (model/Humanoid/AnimationController) from a list of keyframe poses. Use to animate parts procedurally.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Optional instance ref (from ResolveReference) of the target model/part."},
+                "path": {"type": "string", "description": "Optional workspace path to the target."},
+                "name": {"type": "string", "description": "Animation name."},
+                "fps": {"type": "number", "description": "Keyframe playback fps (default 30)."},
+                "loop": {"type": "boolean", "description": "Loop the animation (default true)."},
+                "keyframes": {
+                    "type": "array",
+                    "description": "Ordered keyframes.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "time": {"type": "number", "description": "Time (seconds) of this keyframe."},
+                            "poses": {
+                                "type": "array",
+                                "description": "Poses at this keyframe.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "part": {"type": "string"},
+                                        "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"},
+                                        "rx": {"type": "number"}, "ry": {"type": "number"}, "rz": {"type": "number"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "required": ["keyframes"]
+        },
     },
 }
 
@@ -716,17 +753,53 @@ async def call_gateway_tool(request: Request):
     tool_name = body.get("tool", "")
     args = body.get("arguments", {})
 
-    # Check builtin tools first
-    if tool_name in BUILTIN_TOOLS:
+    # Only search_* tools are executed locally; everything else proxies to upstream /tools/call
+    if tool_name in ("search_animations", "search_sounds"):
         tool = BUILTIN_TOOLS[tool_name]
-        result = {
-            "tool": tool_name,
-            "arguments": args,
-            "result": f"Executed builtin tool '{tool_name}' with args {args}",
-            "source": "builtin",
-            "timestamp": time.time(),
-        }
-        return {"ok": True, "result": result}
+        query = str(args.get("query", "") or "")
+        try:
+            from urllib.parse import quote
+            encoded = quote(query)
+            # Animation uses catalog API; Sound uses toolbox API
+            if tool_name == "search_animations":
+                url = f"/roblox-proxy/catalog.roblox.com/v1/search/items/details?Category=12&Subcategory=27&Keyword={encoded}&Limit=20&SortType=Relevance"
+            else:
+                url = f"/roblox-proxy/apis.roblox.com/toolbox-service/v2/assets:search?searchCategoryType=Audio&keyword={encoded}&limit=20"
+            r = _proxy("GET", url, headers=_proxy_headers())
+            items = []
+            if r.status_code == 200:
+                try:
+                    j = r.json()
+                except Exception:
+                    j = {}
+                if tool_name == "search_animations":
+                    for it in (j.get("data") or []):
+                        aid = it.get("id")
+                        if aid:
+                            items.append({
+                                "id": aid,
+                                "name": it.get("name") or f"Asset #{aid}",
+                                "creator": it.get("creatorName") or (it.get("creator") or {}).get("name", "") or "",
+                            })
+                else:
+                    for it in (j.get("data") or []):
+                        aid = it.get("id")
+                        if aid:
+                            items.append({
+                                "id": aid,
+                                "name": it.get("name") or f"Asset #{aid}",
+                                "creator": it.get("creatorName") or (it.get("creator") or {}).get("name", "") or "",
+                            })
+            result = {
+                "tool": tool_name,
+                "arguments": args,
+                "result": {"query": query, "count": len(items), "items": items},
+                "source": "builtin",
+                "timestamp": time.time(),
+            }
+            return {"ok": True, "result": result}
+        except Exception as e:
+            return {"ok": False, "error": f"tool execution failed: {e}"}
 
     # Check custom tools next
     if tool_name in CUSTOM_TOOLS:
