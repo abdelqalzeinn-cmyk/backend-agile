@@ -671,10 +671,11 @@ def forward_freellmapi(body: dict) -> Response:
     headers = _freellmapi_headers()
     headers["HTTP-Referer"] = "http://localhost:8765"
     headers["X-Title"] = "AgileBot Gateway"
-    # FreeLLMAPI's own API doesn't know the "freellmapi/" bookkeeping prefix
-    # AgileBot puts on the model id -- strip it before forwarding.
+    # FreeLLMAPI's own API only accepts "auto" (or a family name); specific
+    # sub-model ids from its /v1/models catalog error out. Force "auto" so any
+    # freellmapi/* selection works through the direct forwarder too.
     fixed_body = dict(body)
-    fixed_body["model"] = _strip_prefix(str(body.get("model", "")), "freellmapi")
+    fixed_body["model"] = "auto"
     with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(120.0, connect=10.0)) as client:
         r = client.post(url, json=fixed_body, headers=headers)
     return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
@@ -743,7 +744,10 @@ def _call_custom_model_sync(model_id: str, messages: list) -> dict:
         endpoint = m.get("endpoint")
     elif model_id == "openrouter/auto":
         provider, endpoint, real_model = "openrouter", OPENROUTER_API_URL, "openrouter/auto"
-    elif model_id == "freellmapi/auto":
+    elif model_id.startswith("freellmapi/"):
+        # FreeLLMAPI only accepts "auto" (or a family name); specific sub-model
+        # ids from its /v1/models catalog error out. Force the site's working
+        # "auto" model so every freellmapi/* selection just works, no fallback.
         provider, real_model = "freellmapi", "auto"
 
     if provider == "openrouter":
