@@ -695,7 +695,21 @@ def _strip_prefix(model_id: str, provider_prefix: str) -> str:
 
 
 def _is_custom_model(model_id: str) -> bool:
-    return bool(model_id) and (model_id in CUSTOM_MODELS or model_id in CUSTOM_MODEL_ALIASES)
+    if not model_id:
+        return False
+    if model_id in CUSTOM_MODELS or model_id in CUSTOM_MODEL_ALIASES:
+        return True
+    # Plugin sends prefixed ids (freellmapi/..., openrouter/...); route any of
+    # those to our local handler even if the exact id isn't in CUSTOM_MODELS
+    # (e.g. a synced sub-model whose raw id differs from the prefixed send).
+    if model_id.startswith("freellmapi/") or model_id.startswith("openrouter/"):
+        return True
+    # Also accept the stripped raw id in case the picker sends it unprefixed.
+    if _strip_prefix(model_id, "freellmapi") in CUSTOM_MODELS:
+        return True
+    if _strip_prefix(model_id, "openrouter") in CUSTOM_MODELS:
+        return True
+    return False
 
 
 def _build_tools_payload() -> list:
@@ -749,6 +763,17 @@ def _call_custom_model_sync(model_id: str, messages: list) -> dict:
         # ids from its /v1/models catalog error out. Force the site's working
         # "auto" model so every freellmapi/* selection just works, no fallback.
         provider, real_model = "freellmapi", "auto"
+    else:
+        # Bare synced id (no prefix) — look it up in the catalog by stripped form.
+        for pfx in ("freellmapi/", "openrouter/"):
+            cand = _strip_prefix(model_id, pfx)
+            if cand in CUSTOM_MODELS:
+                m = CUSTOM_MODELS[cand]
+                provider = m.get("provider", "openrouter")
+                endpoint = m.get("endpoint")
+                if provider == "freellmapi":
+                    real_model = "auto"
+                break
 
     if provider == "openrouter":
         if not OPENROUTER_KEY:
