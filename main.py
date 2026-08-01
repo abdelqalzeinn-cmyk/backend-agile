@@ -454,6 +454,26 @@ async def get_system_prompt():
     }
 
 
+@app.post("/admin/models/sync-freellmapi")
+def admin_models_sync_freellmapi():
+    if not FREELLMAPI_KEY:
+        return JSONResponse({
+            "ok": False,
+            "error": "FREELLMAPI_KEY not set in environment",
+            "fix": "Set FREELLMAPI_KEY on the Render service env vars, then POST here.",
+        }, status_code=500)
+    try:
+        result = sync_freellmapi_models()
+    except Exception as e:
+        return JSONResponse({"detail": f"Sync failed: {e}"}, status_code=500)
+    return JSONResponse({
+        "ok": True,
+        "key_set": bool(FREELLMAPI_KEY),
+        "total_custom": len(CUSTOM_MODELS),
+        **result,
+    })
+
+
 @app.get("/operations/{operation_id}/events")
 def operation_events(operation_id: str, after_seq: int = 0, limit: int = 50):
     with OPERATION_LOCK:
@@ -647,15 +667,28 @@ def _freellmapi_headers() -> dict:
 def fetch_freellmapi_models() -> list:
     if not FREELLMAPI_URL:
         return []
-    try:
-        with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30.0)) as client:
-            r = client.get(f"{FREELLMAPI_URL.rstrip('/')}/v1/models", headers=_freellmapi_headers())
-            if r.status_code != 200:
-                return []
-            data = r.json()
-            return data.get("data", data) if isinstance(data, dict) else data
-    except Exception:
-        return []
+    last_err = None
+    for attempt in range(3):
+        try:
+            with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30.0)) as client:
+                r = client.get(f"{FREELLMAPI_URL.rstrip('/')}/v1/models", headers=_freellmapi_headers())
+                if r.status_code == 429:
+                    # rate-limited — back off and retry
+                    time.sleep(2.0 * (attempt + 1))
+                    last_err = RuntimeError(f"/v1/models 429 (attempt {attempt+1})")
+                    continue
+                if r.status_code != 200:
+                    last_err = RuntimeError(f"/v1/models {r.status_code}")
+                    continue
+                data = r.json()
+                return data.get("data", data) if isinstance(data, dict) else data
+        except Exception as e:
+            last_err = e
+            time.sleep(1.5 * (attempt + 1))
+            continue
+    if last_err:
+        print(f"[freellmapi] sync failed after retries: {last_err}")
+    return []
 
 
 def sync_freellmapi_models() -> dict:
