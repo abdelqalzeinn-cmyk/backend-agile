@@ -27,6 +27,16 @@ DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 CUSTOM_TOOLS_FILE = DATA_DIR / "custom_tools.json"
 CUSTOM_MODELS_FILE = DATA_DIR / "custom_models.json"
+SYSTEM_PROMPT_FILE = DATA_DIR / "system_prompt.txt"
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are AgileBot, an expert Roblox Studio AI assistant that writes clean, correct Luau code.\n"
+    "You have access to tools that operate inside Roblox Studio. Prefer calling those tools when "
+    "the user asks you to build, modify, animate, or search assets in their experience.\n"
+    "When writing Luau: follow Roblox Luau conventions, use task.spawn/wait instead of spawn/"
+    "wait where appropriate, guard pcall around HttpService and DataStore calls, and never use "
+    "Lua 5.1-only syntax (no +=, no const). Keep scripts small, readable, and production-safe."
+)
 
 def load_json(path: Path, default):
     if path.exists():
@@ -36,8 +46,14 @@ def load_json(path: Path, default):
 def save_json(path: Path, data):
     path.write_text(json.dumps(data, indent=2), encoding='utf-8')
 
+def load_system_prompt() -> str:
+    if SYSTEM_PROMPT_FILE.exists():
+        return SYSTEM_PROMPT_FILE.read_text(encoding='utf-8').strip()
+    return DEFAULT_SYSTEM_PROMPT
+
 CUSTOM_TOOLS: dict = load_json(CUSTOM_TOOLS_FILE, {})
 CUSTOM_MODELS: dict = load_json(CUSTOM_MODELS_FILE, {})
+SYSTEM_PROMPT: str = load_system_prompt()
 
 LOCAL_CONVERSATIONS_FILE = DATA_DIR / "local_conversations.json"
 LOCAL_CONVERSATIONS: dict = load_json(LOCAL_CONVERSATIONS_FILE, {})
@@ -426,6 +442,19 @@ async def proxy_post(path: str, request: Request):
                             "type": "function",
                             "function": t,
                         })
+
+        # Inject the system prompt as the first system message so the model
+        # follows our Roblox/Luau conventions and tool-usage guidance.
+        if SYSTEM_PROMPT:
+            msgs = body.get("messages", [])
+            if not isinstance(msgs, list):
+                msgs = []
+            if not msgs or msgs[0].get("role") != "system":
+                body["messages"] = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
+            else:
+                # prepend our guidance to the existing system message
+                msgs[0] = {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + msgs[0].get("content", "")}
+                body["messages"] = msgs
         # Route custom models to their provider
         if model_id in CUSTOM_MODELS:
             model = CUSTOM_MODELS[model_id]
@@ -820,22 +849,26 @@ async def call_gateway_tool(request: Request):
 
 @app.post("/admin/system-prompt")
 async def update_system_prompt(request: Request):
-    """Inject custom instructions into the system prompt."""
+    """Inject custom instructions into the system prompt (persisted to disk)."""
+    global SYSTEM_PROMPT
     body = await request.json()
-    instruction = body.get("instruction", "")
+    instruction = (body.get("instruction") or "").strip()
     if not instruction:
         return {"ok": False, "error": "instruction required"}
+    SYSTEM_PROMPT = instruction
+    SYSTEM_PROMPT_FILE.write_text(instruction, encoding='utf-8')
     return {
         "ok": True,
-        "system_prompt": instruction,
+        "system_prompt": SYSTEM_PROMPT,
         "available_tools": list(BUILTIN_TOOLS.keys()) + list(CUSTOM_TOOLS.keys()),
-        "message": "System prompt updated. Restart backend or reload config to apply."
+        "message": "System prompt saved and will be injected into every chat request.",
     }
 
 @app.get("/admin/system-prompt")
 async def get_system_prompt():
     """Get current system prompt and available tools."""
     return {
+        "system_prompt": SYSTEM_PROMPT,
         "available_tools": list(BUILTIN_TOOLS.keys()) + list(CUSTOM_TOOLS.keys()),
         "builtin_count": len(BUILTIN_TOOLS),
         "custom_count": len(CUSTOM_TOOLS),
