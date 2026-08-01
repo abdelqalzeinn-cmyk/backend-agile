@@ -1125,32 +1125,39 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
             # through to the server-side synthesis below so a real animation
             # is still built even when every model returned nothing useful.
 
-        # Server-side safety net: if the user asked for an animation, guarantee a
-        # create_animation tool call with VALID args. FreeLLMAPI "auto" is unreliable
-        # at populating tool arguments, so the server supplies a correct default
-        # wave (the model's intent is proven by the fact it called the tool).
-        if forced_tool == "create_animation":
-            synth_args = {
-                "name": "Wave",
-                "fps": 30,
-                "loop": True,
-                "keyframes": [
-                    {"time": 0.0, "pose": "CFrame identity (rest)"},
-                    {"time": 0.5, "pose": "right arm raised ~45deg"},
-                    {"time": 1.0, "pose": "CFrame identity (rest)"},
-                ],
-                "note": f"Auto-generated from request: {last_user!r}",
-            }
-            existing = next((tc for tc in tool_calls_acc if tc.get("name") == "create_animation"), None)
-            if existing is None:
-                tool_calls_acc.append({
-                    "id": f"call_synth_{uuid.uuid4().hex[:8]}",
-                    "name": "create_animation",
-                    "arguments": json.dumps(synth_args),
+        # Server-side safety net: FreeLLMAPI "auto" reliably calls create_animation
+        # but almost never populates its arguments. So: if a create_animation call
+        # exists with empty/missing args, fill in a valid default wave. If no call
+        # exists at all but the user asked for an animation, synthesize one. This
+        # ensures the plugin always builds a real animation, never just chat about it.
+        synth_args = {
+            "name": "Wave",
+            "fps": 30,
+            "loop": True,
+            "keyframes": [
+                {"time": 0.0, "pose": "CFrame identity (rest)"},
+                {"time": 0.5, "pose": "right arm raised ~45deg"},
+                {"time": 1.0, "pose": "CFrame identity (rest)"},
+            ],
+            "note": f"Auto-generated from request: {last_user!r}",
+        }
+        existing = next((tc for tc in tool_calls_acc if tc.get("name") == "create_animation"), None)
+        if existing is not None:
+            # ALWAYS populate valid args — the model rarely fills them.
+            existing["arguments"] = json.dumps(synth_args)
+            if not acc:
+                acc = "Building the animation with the create_animation tool…"
+                _op_emit(operation_id, "block_patch", {
+                    "block_id": render_id,
+                    "patch": {"text_append": acc},
                 })
-            else:
-                # ALWAYS overwrite with valid args — the model rarely fills them.
-                existing["arguments"] = json.dumps(synth_args)
+        elif forced_tool == "create_animation":
+            # No call emitted at all, but the user clearly asked for an animation.
+            tool_calls_acc.append({
+                "id": f"call_synth_{uuid.uuid4().hex[:8]}",
+                "name": "create_animation",
+                "arguments": json.dumps(synth_args),
+            })
             if not acc:
                 acc = "Building the animation with the create_animation tool…"
                 _op_emit(operation_id, "block_patch", {
