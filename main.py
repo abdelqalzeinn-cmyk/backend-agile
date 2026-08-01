@@ -395,6 +395,36 @@ async def conversations_messages_post(conversation_id: str, request: Request):
     return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
 
 
+
+
+@app.post("/admin/system-prompt")
+async def update_system_prompt(request: Request):
+    """Inject custom instructions into the system prompt (persisted to disk)."""
+    global SYSTEM_PROMPT
+    body = await request.json()
+    instruction = (body.get("instruction") or "").strip()
+    if not instruction:
+        return {"ok": False, "error": "instruction required"}
+    SYSTEM_PROMPT = instruction
+    SYSTEM_PROMPT_FILE.write_text(instruction, encoding='utf-8')
+    return {
+        "ok": True,
+        "system_prompt": SYSTEM_PROMPT,
+        "available_tools": list(BUILTIN_TOOLS.keys()) + list(CUSTOM_TOOLS.keys()),
+        "message": "System prompt saved and will be injected into every chat request.",
+    }
+
+@app.get("/admin/system-prompt")
+async def get_system_prompt():
+    """Get current system prompt and available tools."""
+    return {
+        "system_prompt": SYSTEM_PROMPT,
+        "available_tools": list(BUILTIN_TOOLS.keys()) + list(CUSTOM_TOOLS.keys()),
+        "builtin_count": len(BUILTIN_TOOLS),
+        "custom_count": len(CUSTOM_TOOLS),
+    }
+
+
 @app.get("/{path:path}")
 async def proxy_get(path: str, request: Request):
     h = dict(_proxy_headers())
@@ -845,34 +875,6 @@ async def call_gateway_tool(request: Request):
     # Proxy to upstream
     r = _proxy("POST", "/tools/call", body=body)
     return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
-
-
-@app.post("/admin/system-prompt")
-async def update_system_prompt(request: Request):
-    """Inject custom instructions into the system prompt (persisted to disk)."""
-    global SYSTEM_PROMPT
-    body = await request.json()
-    instruction = (body.get("instruction") or "").strip()
-    if not instruction:
-        return {"ok": False, "error": "instruction required"}
-    SYSTEM_PROMPT = instruction
-    SYSTEM_PROMPT_FILE.write_text(instruction, encoding='utf-8')
-    return {
-        "ok": True,
-        "system_prompt": SYSTEM_PROMPT,
-        "available_tools": list(BUILTIN_TOOLS.keys()) + list(CUSTOM_TOOLS.keys()),
-        "message": "System prompt saved and will be injected into every chat request.",
-    }
-
-@app.get("/admin/system-prompt")
-async def get_system_prompt():
-    """Get current system prompt and available tools."""
-    return {
-        "system_prompt": SYSTEM_PROMPT,
-        "available_tools": list(BUILTIN_TOOLS.keys()) + list(CUSTOM_TOOLS.keys()),
-        "builtin_count": len(BUILTIN_TOOLS),
-        "custom_count": len(CUSTOM_TOOLS),
-    }
 
 if __name__ == "__main__":
     import uvicorn
