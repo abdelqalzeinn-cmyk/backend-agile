@@ -970,7 +970,11 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
                          assistant_seq: int, tool_calls_acc: list):
     """Background worker: call the provider with stream:true, push block events
     to the operation store so the plugin renders live typing."""
-    render_id = f"message:{uuid.uuid4().hex}"
+    # Render id MUST match the one the timeline endpoint uses for the assistant
+    # block ("message:<assistant_seq>"), otherwise the post-stream
+    # fetchTimelineAsync() reconcile inserts a SECOND assistant block with a
+    # different render_id and the model reply looks duplicated.
+    render_id = f"message:{assistant_seq}"
     # 1) upsert the assistant block in 'streaming' state
     _op_emit(operation_id, "block_upsert", {
         "block": {
