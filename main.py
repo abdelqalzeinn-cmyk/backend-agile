@@ -925,8 +925,14 @@ def _call_custom_model_sync(model_id: str, messages: list) -> dict:
 
 
 def _make_block(role: str, text: str, seq_n: int) -> dict:
+    # `render_id` MUST equal `message:<seq_n>` so the plugin's putBlock() dedupes
+    # this timeline block against the streamed assistant block (which the worker
+    # emits as `message:<assistant_seq>`). A fresh uuid per call would make the
+    # post-stream fetchTimelineAsync() reconcile insert a SECOND model reply.
+    rid = f"message:{seq_n}"
     return {
-        "id": f"message:{uuid.uuid4().hex}",
+        "id": rid,
+        "render_id": rid,
         "role": role,
         "text": text,
         "seq": seq_n,
