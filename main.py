@@ -1206,16 +1206,37 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
 def _handle_custom_conversation(model_id: str, message: str, conversation_id: str | None) -> dict:
     conv_id = conversation_id or uuid.uuid4().hex
     conv = LOCAL_CONVERSATIONS.get(conv_id)
+    now_ms = int(time.time() * 1000)
     if conv is None:
         conv = {"id": conv_id, "name": (message or "New Chat")[:40], "messages": [], "next_seq": 1}
         LOCAL_CONVERSATIONS[conv_id] = conv
 
-    conv["messages"].append({"role": "user", "content": message})
+    # Guard against a duplicate user message (the plugin can double-fire the same
+    # send). If the last message is identical text and arrived <2s ago, treat it as
+    # a repeat: do NOT append again and do NOT start a second stream.
+    last = conv["messages"][-1] if conv["messages"] else None
+    dup = (last and last.get("role") == "user" and last.get("content") == message
+           and (now_ms - int(last.get("_ts", 0))) < 2000)
+    if not dup:
+        conv["messages"].append({"role": "user", "content": message, "_ts": now_ms})
     user_seq, assistant_seq = conv["next_seq"], conv["next_seq"] + 1
     conv["next_seq"] = assistant_seq + 1
     save_json(LOCAL_CONVERSATIONS_FILE, LOCAL_CONVERSATIONS)
 
+    # If a stream is already running for this conversation, just return its
+    # existing operation_id so the plugin keeps polling instead of spawning a twin.
+    existing_op = conv.get("_active_operation_id")
+    if existing_op and existing_op in OPERATION_EVENTS and OPERATION_EVENTS[existing_op].get("status") == "running":
+        return {
+            "status": "running",
+            "operation_id": existing_op,
+            "conversation": {"id": conv_id, "name": conv["name"]},
+            "timeline": [_make_block("user", message, user_seq)],
+            "has_more_older": False,
+        }
+
     operation_id = uuid.uuid4().hex
+    conv["_active_operation_id"] = operation_id
     # seed the operation store
     with OPERATION_LOCK:
         OPERATION_EVENTS[operation_id] = {"status": "running", "events": [], "seq": 0}
