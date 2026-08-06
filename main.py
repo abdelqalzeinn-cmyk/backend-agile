@@ -530,10 +530,56 @@ def _is_custom_model(model_id: str) -> bool:
 
 def _handle_custom_conversation(model_id: str, message: str, conversation_id: str | None) -> dict:
     conv_id = conversation_id or uuid.uuid4().hex
+    conv = LOCAL_CONVERSATIONS.get(conv_id)
+    now_ms = int(time.time() * 1000)
+    if conv is None:
+        conv = {
+            "id": conv_id, 
+            "name": (message or "New Chat")[:40], 
+            "messages": [], 
+            "next_seq": 1,
+            "created_at": now_ms
+        }
+        LOCAL_CONVERSATIONS[conv_id] = conv
+
+    # Guard against duplicate user messages
+    last = conv["messages"][-1] if conv["messages"] else None
+    dup = (last and last.get("role") == "user" and last.get("content") == message
+           and (now_ms - int(last.get("_ts", 0))) < 2000)
+    if not dup and message:
+        conv["messages"].append({"role": "user", "content": message, "_ts": now_ms})
+    
+    user_seq = conv["next_seq"]
+    assistant_seq = user_seq + 1
+    conv["next_seq"] = assistant_seq + 1
+    save_json(LOCAL_CONVERSATIONS_FILE, LOCAL_CONVERSATIONS)
+
+    operation_id = uuid.uuid4().hex
+    conv["_active_operation_id"] = operation_id
+    
+    with OPERATION_LOCK:
+        OPERATION_EVENTS[operation_id] = {"status": "running", "events": [], "seq": 0}
+
+    tool_calls_acc: list = []
+    t = threading.Thread(
+        target=_stream_custom_model,
+        args=(operation_id, model_id, conv["messages"], conv_id, assistant_seq, tool_calls_acc),
+        daemon=True,
+    )
+    t.start()
+
+    # Return a structured response matching normal conversation creation objects
     return {
-        "status": "completed",
-        "conversation": {"id": conv_id, "name": (message or "New Chat")[:40]},
-        "timeline": [],
+        "id": conv_id,
+        "name": conv["name"],
+        "status": "running",
+        "operation_id": operation_id,
+        "conversation": {
+            "id": conv_id,
+            "name": conv["name"],
+            "created_at": now_ms
+        },
+        "timeline": [_make_block("user", message, user_seq)] if message else [],
         "has_more_older": False,
     }
 
