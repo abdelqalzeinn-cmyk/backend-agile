@@ -332,20 +332,37 @@ async def conversations_post(request: Request):
     a = request.headers.get("authorization") or request.headers.get("Authorization")
     if a:
         h["authorization"] = a
-    body = await request.body()
+    
     try:
-        body_json = json.loads(body) if body else {}
+        body_json = await request.json()
     except Exception:
         body_json = {}
-    model_id = str(body_json.get("model", ""))
+
+    if isinstance(body_json, str):
+        try:
+            body_json = json.loads(body_json)
+        except Exception:
+            body_json = {"message": body_json}
+
+    model_id = str(body_json.get("model", "auto"))
+    if model_id == "auto" or not model_id:
+        model_id = "freellmapi/auto"
+        body_json["model"] = model_id
+
+    message_text = str(body_json.get("message", "") or body_json.get("text", ""))
+    if not message_text and isinstance(body_json.get("context_revision"), dict):
+        rev = body_json.get("context_revision")
+        message_text = str(rev.get("message", "") or rev.get("prompt", ""))
+
+    # Intercept and create the conversation locally so it never fails upstream
     if _is_custom_model(model_id):
         try:
-            result = _handle_custom_conversation(model_id, body_json.get("message", ""), None)
+            result = _handle_custom_conversation(model_id, message_text, None)
             return JSONResponse(content=result, status_code=200)
         except Exception as e:
             return JSONResponse({"detail": {"code": "custom_model_error", "model": model_id, "message": str(e)}}, status_code=502)
 
-    r, err = _safe_proxy("POST", "/conversations", body=body, headers=h)
+    r, err = _safe_proxy("POST", "/conversations", body=body_json, headers=h)
     if err:
         return JSONResponse(content=err, status_code=502)
     return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
