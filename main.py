@@ -504,7 +504,8 @@ def sync_openrouter_free_models():
 def _is_custom_model(model_id: str) -> bool:
     if not model_id:
         return False
-    if model_id in CUSTOM_MODELS or model_id in CUSTOM_MODEL_ALIASES:
+    # Treat "auto", aliases, and any freellmapi/openrouter prefix as a custom model
+    if model_id in CUSTOM_MODELS or model_id in CUSTOM_MODEL_ALIASES or model_id == "auto":
         return True
     if model_id.startswith("freellmapi/") or model_id.startswith("openrouter/"):
         return True
