@@ -356,21 +356,37 @@ async def conversations_messages_post(conversation_id: str, request: Request):
     a = request.headers.get("authorization") or request.headers.get("Authorization")
     if a:
         h["authorization"] = a
-    body = await request.body()
+    
     try:
-        body_json = json.loads(body) if body else {}
+        body_json = await request.json()
     except Exception:
         body_json = {}
-    model_id = str(body_json.get("model", ""))
 
+    # Handle cases where the plugin body payload nests or passes raw inputs
+    if isinstance(body_json, str):
+        try:
+            body_json = json.loads(body_json)
+        except Exception:
+            body_json = {"message": body_json}
+
+    model_id = str(body_json.get("model", ""))
+    message_text = str(body_json.get("message", "") or body_json.get("text", ""))
+
+    # If the body contains a context_revision dictionary, extract the message text from it if missing
+    if not message_text and isinstance(body_json.get("context_revision"), dict):
+        rev = body_json.get("context_revision")
+        message_text = str(rev.get("message", "") or rev.get("prompt", ""))
+
+    # Route to the local shim if this is a custom model OR this conversation was already started locally
     if _is_custom_model(model_id) or conversation_id in LOCAL_CONVERSATIONS:
         try:
-            result = _handle_custom_conversation(model_id, body_json.get("message", ""), conversation_id)
+            result = _handle_custom_conversation(model_id, message_text, conversation_id)
             return JSONResponse(content=result, status_code=200)
         except Exception as e:
             return JSONResponse({"detail": {"code": "custom_model_error", "model": model_id, "message": str(e)}}, status_code=502)
 
-    r, err = _safe_proxy("POST", f"/conversations/{conversation_id}/messages", body=body, headers=h)
+    # Re-encode clean body for upstream proxying
+    r, err = _safe_proxy("POST", f"/conversations/{conversation_id}/messages", body=body_json, headers=h)
     if err:
         return JSONResponse(content=err, status_code=502)
     return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
