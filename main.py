@@ -296,6 +296,40 @@ def tools_gateway_call(tool_name: str, args: dict, conv_id: str):
             return {"ok": True, "result": resp.json()}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+@app.get("/conversations/{conversation_id}/timeline")
+def conversations_timeline(conversation_id: str, request: Request, operation_id: str = None):
+    conv = LOCAL_CONVERSATIONS.get(conversation_id)
+    if conv is None:
+        return JSONResponse(content={"conversation": {"id": conversation_id, "name": "Custom Session"}, "timeline": [], "has_more_older": False}, status_code=200)
+
+    blocks = []
+    seq = 1
+    for m in conv.get("messages", []):
+        role = m.get("role", "user")
+        blocks.append(_make_block(role, m.get("content", ""), seq))
+        seq += 1
+        
+    return JSONResponse(content={
+        "conversation": {"id": conv.get("id", conversation_id), "name": conv.get("name", "Session")},
+        "timeline": blocks,
+        "has_more_older": False,
+    })
+
+@app.post("/operations/{operation_id}/tool_results")
+async def operations_tool_results_post(operation_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    
+    try:
+        url = f"{BROKER_URL.rstrip('/')}/operations/{operation_id}/tool_results"
+        with httpx.Client(timeout=10.0) as client:
+            client.post(url, json=body)
+    except Exception:
+        pass
+        
+    return JSONResponse(content={"ok": True})
 
 @app.post("/tools/gateway/call")
 async def tools_gateway_call_endpoint(request: Request):
