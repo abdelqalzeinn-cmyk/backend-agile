@@ -527,6 +527,88 @@ def _is_custom_model(model_id: str) -> bool:
     if model_id.startswith("freellmapi/") or model_id.startswith("openrouter/"):
         return True
     return False
+    
+def _parse_sse_lines(raw: str):
+    """Yield data payloads from an SSE byte stream (lines prefixed 'data:')."""
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            return
+        yield data
+
+
+def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_id: str,
+                         assistant_seq: int, tool_calls_acc: list):
+    """Background worker: call the provider with stream:true, push block events
+    to the operation store so the plugin renders live typing."""
+    render_id = f"message:{assistant_seq}"
+    _op_emit(operation_id, "block_upsert", {
+        "block": {
+            "render_id": render_id,
+            "id": render_id,
+            "role": "assistant",
+            "text": "",
+            "seq": assistant_seq,
+            "created_at_unix_ms": int(time.time() * 1000),
+            "streaming": True,
+        }
+    })
+
+    acc = ""
+    try:
+        url = f"{FREELLMAPI_URL.rstrip('/')}/v1/chat/completions"
+        headers = _freellmapi_headers()
+        headers["HTTP-Referer"] = "http://localhost:8765"
+        headers["X-Title"] = "AgileBot Gateway"
+
+        sys_msgs = list(messages)
+        if SYSTEM_PROMPT:
+            if not sys_msgs or sys_msgs[0].get("role") != "system":
+                sys_msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + sys_msgs
+            else:
+                sys_msgs[0] = {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + sys_msgs[0].get("content", "")}
+
+        body = {"model": "auto", "messages": sys_msgs, "stream": True}
+        
+        with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(connect=10.0, read=25.0, write=30.0)) as client:
+            with client.stream("POST", url, json=body, headers=headers) as resp:
+                if resp.status_code != 200:
+                    raise RuntimeError(f"Stream error {resp.status_code}: {resp.read().decode()[:200]}")
+                for chunk in resp.iter_lines():
+                    for data in _parse_sse_lines(chunk):
+                        try:
+                            piece = json.loads(data)
+                        except Exception:
+                            continue
+                        delta = (piece.get("choices") or [{}])[0].get("delta") or {}
+                        text_delta = delta.get("content") or ""
+                        if text_delta:
+                            acc += text_delta
+                            _op_emit(operation_id, "block_patch", {
+                                "block_id": render_id,
+                                "patch": {"text_append": text_delta},
+                            })
+
+        _op_emit(operation_id, "block_patch", {
+            "block_id": render_id,
+            "patch": {"streaming": False, "text": acc},
+        })
+        _op_finish(operation_id, "completed")
+
+        conv = LOCAL_CONVERSATIONS.get(conv_id)
+        if conv is not None:
+            conv["messages"].append({"role": "assistant", "content": acc})
+            save_json(LOCAL_CONVERSATIONS_FILE, LOCAL_CONVERSATIONS)
+
+    except Exception as e:
+        _op_emit(operation_id, "block_patch", {
+            "block_id": render_id,
+            "patch": {"streaming": False, "text": f"[error] {e}"},
+        })
+        _op_finish(operation_id, "completed")
 
 def _handle_custom_conversation(model_id: str, message: str, conversation_id: str | None) -> dict:
     conv_id = conversation_id or uuid.uuid4().hex
