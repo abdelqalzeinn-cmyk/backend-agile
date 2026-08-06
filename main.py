@@ -538,7 +538,34 @@ def _parse_sse_lines(raw: str):
         if data == "[DONE]":
             return
         yield data
+        
+def _make_block(role: str, text: str, seq_n: int) -> dict:
+    rid = f"message:{seq_n}"
+    return {
+        "id": rid,
+        "render_id": rid,
+        "role": role,
+        "text": text,
+        "seq": seq_n,
+        "created_at_unix_ms": int(time.time() * 1000),
+    }
 
+def _op_emit(operation_id: str, event_type: str, payload: dict):
+    with OPERATION_LOCK:
+        op = OPERATION_EVENTS.get(operation_id)
+        if op is None:
+            op = {"status": "running", "events": [], "seq": 0}
+            OPERATION_EVENTS[operation_id] = op
+        op["seq"] += 1
+        op["events"].append({"seq": op["seq"], "type": event_type, "payload": payload})
+
+def _op_finish(operation_id: str, status: str = "completed"):
+    with OPERATION_LOCK:
+        op = OPERATION_EVENTS.get(operation_id)
+        if op is None:
+            op = {"status": "running", "events": [], "seq": 0}
+            OPERATION_EVENTS[operation_id] = op
+        op["status"] = status
 
 def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_id: str,
                          assistant_seq: int, tool_calls_acc: list):
