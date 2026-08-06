@@ -34,16 +34,14 @@ CUSTOM_MODELS_FILE = DATA_DIR / "custom_models.json"
 SYSTEM_PROMPT_FILE = DATA_DIR / "system_prompt.txt"
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are AgileBot, an expert Roblox Studio AI assistant that writes clean, correct Luau code.\n"
-    "You have access to tools that operate INSIDE Roblox Studio (create_animation, search_animations, search_sounds).\n"
-    "CRITICAL TOOL-USAGE RULE: When the user asks you to build, animate, modify, or search anything in their "
-    "experience, you MUST call the matching tool via a tool_call — NEVER just describe the steps, NEVER hand back a "
-    "script for the user to paste, and NEVER tell the user to run something themselves. The tool runs it for them.\n"
-    "When you call a tool, you MUST populate EVERY relevant parameter with a concrete value (animation name, fps, "
-    "loop, and a full keyframes array with time/pose/CFrame data). Do NOT call a tool with empty or missing arguments "
-    "— an empty call does nothing. If you need a target you can omit ref/path (it defaults to the selected/player model).\n"
-    "Example create_animation call: name='Wave', fps=30, loop=true, keyframes=[{time=0,pose='CFrame identity'},"
-    "{time=0.5,pose='Arm raised'}, {time=1.0,pose='CFrame identity'}].\n"
+    "You are AgileBot, an expert Roblox Studio AI assistant and developer that writes clean, correct Luau code.\n"
+    "You have access to tools that operate INSIDE Roblox Studio (create_animation, search_animations, search_sounds), "
+    "a live web search tool (web_search) to look up up-to-date documentation and facts, "
+    "and a command execution tool (run_cmds) to run scripts, system commands, or environment setup steps.\n"
+    "CRITICAL TOOL-USAGE RULE: When the user asks you to build, animate, modify, search anything in their "
+    "experience, look up live technical information, or run commands, you MUST call the matching tool via a tool_call — NEVER just describe "
+    "the steps, NEVER hand back code for the user to run manually, and NEVER tell the user to execute terminal commands themselves. The tools run them for the user.\n"
+    "When you call a tool, you MUST populate EVERY relevant parameter with a concrete value. Do NOT call a tool with empty or missing arguments.\n"
     "Only fall back to writing Luau code in the chat when the user explicitly asks for raw script text.\n"
     "When writing Luau: follow Roblox Luau conventions, use task.spawn/wait instead of spawn/wait where appropriate, "
     "guard pcall around HttpService and DataStore calls, and never use Lua 5.1-only syntax (no +=, no const). "
@@ -140,8 +138,31 @@ BUILTIN_TOOLS = {
             "required": ["keyframes"]
         },
     },
+    "web_search": {
+        "name": "web_search",
+        "description": "Search the live web for up-to-date documentation, APIs, facts, or technical solutions. Use this for real-time information.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The search query to perform."}
+            },
+            "required": ["query"],
+        },
+        "endpoint": "https://broker-for-model-agile.onrender.com/tools/web_search?query={query}",
+    },
+    "run_cmds": {
+        "name": "run_cmds",
+        "description": "Execute system terminal commands, environment setup scripts, or automation tasks via the broker.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "commands": {"type": "string", "description": "The specific command or script string to execute."}
+            },
+            "required": ["commands"],
+        },
+        "endpoint": "https://broker-for-model-agile.onrender.com/tools/run_cmds",
+    },
 }
-
 def _add_auth(headers: dict, request: Request) -> dict:
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
     if auth:
@@ -259,8 +280,39 @@ async def models_gateway(request: Request):
     }
 
 @app.get("/tools/gateway")
-def tools_gateway():
-    return list_gateway_tools()
+def tools_gateway_call(tool_name: str, args: dict, conv_id: str):
+    """Proxies tool execution requests to the broker."""
+    try:
+        url = f"{BROKER_URL.rstrip('/')}/tools/execute"
+        payload = {
+            "tool_name": tool_name,
+            "arguments": args,
+            "conversation_id": conv_id
+        }
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(url, json=payload)
+            if resp.status_code != 200:
+                return {"ok": False, "error": f"Broker tool error: {resp.status_code}"}
+            return {"ok": True, "result": resp.json()}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.post("/tools/gateway/call")
+async def tools_gateway_call_endpoint(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    
+    tool_name = str(body.get("tool_name", "") or body.get("name", ""))
+    args = body.get("arguments", body.get("args", {}))
+    conv_id = str(body.get("conversation_id", body.get("conv_id", "")))
+    
+    if not tool_name:
+        return JSONResponse({"ok": False, "error": "Missing tool_name"}, status_code=400)
+        
+    result = tools_gateway_call(tool_name, args, conv_id)
+    return JSONResponse(content=result)
 
 @app.post("/tools/gateway/call")
 async def tools_gateway_call(request: Request):
