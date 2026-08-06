@@ -1,3 +1,171 @@
+"""AgileBot Gateway Backend
+- Proxies to https://api.agilebot.dev for native models/tools
+- Adds custom models + tools on top
+- Routes custom models to OpenRouter or local providers
+- Integrates model broker communication with https://broker-for-model-agile.onrender.com
+"""
+
+import os
+import json
+import time
+import uuid
+import threading
+from pathlib import Path
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+import httpx
+
+UPSTREAM = os.environ.get("AGILEBOT_UPSTREAM", "https://api.agilebot.dev")
+BROKER_URL = os.environ.get("BROKER_URL", "https://broker-for-model-agile.onrender.com")
+PORT = int(os.environ.get("PORT", "8765"))
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+BUILD_TAG = "build-2026-08-01-createanim-synth-v3"
+FREELLMAPI_URL = os.environ.get("FREELLMAPI_URL", "https://freellmapi-cliz.onrender.com")
+FREELLMAPI_KEY = os.environ.get("FREELLMAPI_KEY", "")
+
+app = FastAPI(title="AgileBot Gateway", version="0.3.0")
+
+# ---------- Persistence ----------
+
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+CUSTOM_TOOLS_FILE = DATA_DIR / "custom_tools.json"
+CUSTOM_MODELS_FILE = DATA_DIR / "custom_models.json"
+SYSTEM_PROMPT_FILE = DATA_DIR / "system_prompt.txt"
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are AgileBot, an expert Roblox Studio AI assistant that writes clean, correct Luau code.\n"
+    "You have access to tools that operate INSIDE Roblox Studio (create_animation, search_animations, search_sounds).\n"
+    "CRITICAL TOOL-USAGE RULE: When the user asks you to build, animate, modify, or search anything in their "
+    "experience, you MUST call the matching tool via a tool_call — NEVER just describe the steps, NEVER hand back a "
+    "script for the user to paste, and NEVER tell the user to run something themselves. The tool runs it for them.\n"
+    "When you call a tool, you MUST populate EVERY relevant parameter with a concrete value (animation name, fps, "
+    "loop, and a full keyframes array with time/pose/CFrame data). Do NOT call a tool with empty or missing arguments "
+    "— an empty call does nothing. If you need a target you can omit ref/path (it defaults to the selected/player model).\n"
+    "Example create_animation call: name='Wave', fps=30, loop=true, keyframes=[{time=0,pose='CFrame identity'},"
+    "{time=0.5,pose='Arm raised'}, {time=1.0,pose='CFrame identity'}].\n"
+    "Only fall back to writing Luau code in the chat when the user explicitly asks for raw script text.\n"
+    "When writing Luau: follow Roblox Luau conventions, use task.spawn/wait instead of spawn/wait where appropriate, "
+    "guard pcall around HttpService and DataStore calls, and never use Lua 5.1-only syntax (no +=, no const). "
+    "Keep scripts small, readable, and production-safe."
+)
+
+def load_json(path: Path, default):
+    if path.exists():
+        return json.loads(path.read_text(encoding='utf-8'))
+    return default
+
+def save_json(path: Path, data):
+    path.write_text(json.dumps(data, indent=2), encoding='utf-8')
+
+def load_system_prompt() -> str:
+    if SYSTEM_PROMPT_FILE.exists():
+        return SYSTEM_PROMPT_FILE.read_text(encoding='utf-8').strip()
+    return DEFAULT_SYSTEM_PROMPT
+
+CUSTOM_TOOLS: dict = load_json(CUSTOM_TOOLS_FILE, {})
+CUSTOM_MODELS: dict = load_json(CUSTOM_MODELS_FILE, {})
+SYSTEM_PROMPT: str = load_system_prompt()
+
+LOCAL_CONVERSATIONS_FILE = DATA_DIR / "local_conversations.json"
+LOCAL_CONVERSATIONS: dict = load_json(LOCAL_CONVERSATIONS_FILE, {})
+
+OPERATION_EVENTS: dict = {}
+OPERATION_LOCK = threading.Lock()
+
+CUSTOM_MODEL_ALIASES = {"openrouter/auto", "freellmapi/auto"}
+
+# ---------- Built-in tools ----------
+
+BUILTIN_TOOLS = {
+    "search_animations": {
+        "name": "search_animations",
+        "description": "Search Roblox catalog for animations by keyword. Returns asset id, name, creator.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "search keyword"},
+                "category": {"type": "string", "description": "optional filter (e.g. emote, run, idle)"},
+            },
+            "required": ["query"],
+        },
+        "endpoint": "/roblox-proxy/catalog.roblox.com/v1/search/items/details?Category=12&Subcategory=27&Keyword={query}&Limit=20&SortType=Relevance",
+    },
+    "search_sounds": {
+        "name": "search_sounds",
+        "description": "Search Roblox catalog for sounds/audio by keyword.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "search keyword"},
+            },
+            "required": ["query"],
+        },
+        "endpoint": "/roblox-proxy/apis.roblox.com/toolbox-service/v1/search?query={query}&category=Audio",
+    },
+    "create_animation": {
+        "name": "create_animation",
+        "description": "Build and PLAY a Roblox KeyframeSequence animation on a target instance (model/Humanoid/AnimationController) from a list of keyframe poses. ALWAYS call this when the user wants an animation/wave/spin/movement built - do not return a script. Required params you MUST provide: name (string), fps (number, default 30), loop (boolean, default true), keyframes (array, each time:number in seconds, pose:string e.g. CFrame identity or left arm up 45deg). Example: name=Wave, fps=30, loop=true, keyframes=[{time=0,pose=CFrame identity},{time=0.5,pose=right arm raised},{time=1.0,pose=CFrame identity}]. If no target is specified, omit ref/path (defaults to the selected/player model).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Optional instance ref (from ResolveReference) of the target model/part."},
+                "path": {"type": "string", "description": "Optional workspace path to the target."},
+                "name": {"type": "string", "description": "Animation name."},
+                "fps": {"type": "number", "description": "Keyframe playback fps (default 30)."},
+                "loop": {"type": "boolean", "description": "Loop the animation (default true)."},
+                "keyframes": {
+                    "type": "array",
+                    "description": "Ordered keyframes.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "time": {"type": "number", "description": "Time (seconds) of this keyframe."},
+                            "poses": {
+                                "type": "array",
+                                "description": "Poses at this keyframe.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "part": {"type": "string"},
+                                        "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"},
+                                        "rx": {"type": "number"}, "ry": {"type": "number"}, "rz": {"type": "number"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "required": ["keyframes"]
+        },
+    },
+}
+
+def _add_auth(headers: dict, request: Request) -> dict:
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if auth:
+        headers["authorization"] = auth
+    return headers
+
+def _proxy_headers() -> dict:
+    return {
+        "accept": "application/json",
+        "accept-encoding": "identity",
+        "user-agent": "AgileBotGateway/0.1 (+https://github.com/abdelqalzeinn-cmyk/backend-agile)",
+    }
+
+_HOP_BY_HOP = {"content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "upgrade"}
+
+def _clean_response_headers(headers: dict) -> dict:
+    return {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
+
+class UpstreamUnavailable(Exception):
+    def __init__(self, message: str, url: str):
+        super().__init__(message)
+        self.message = message
+        self.url = url
+
 def _proxy(method: str, path: str, body: dict | bytes | None = None, headers: dict | None = None) -> httpx.Response:
     url = f"{UPSTREAM}{path}"
     merged = dict(_proxy_headers())
@@ -18,14 +186,6 @@ def _proxy(method: str, path: str, body: dict | bytes | None = None, headers: di
         print(f"[PROXY] Failed to reach upstream {url}: {e}")
         raise UpstreamUnavailable(str(e), url) from e
 
-
-class UpstreamUnavailable(Exception):
-    def __init__(self, message: str, url: str):
-        super().__init__(message)
-        self.message = message
-        self.url = url
-
-
 def _safe_proxy(method: str, path: str, body=None, headers=None):
     """Like _proxy, but returns (Response|None, error_json|None) instead of raising."""
     try:
@@ -39,8 +199,101 @@ def _safe_proxy(method: str, path: str, body=None, headers=None):
             }
         }
 
+# ---------- Health ----------
 
-# --- Updated routes ---
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "upstream": UPSTREAM,
+        "broker": BROKER_URL,
+        "build_tag": BUILD_TAG,
+        "custom_models": len(CUSTOM_MODELS),
+        "custom_tools": len(CUSTOM_TOOLS),
+    }
+
+@app.get("/models/gateway")
+async def models_gateway(request: Request):
+    h = dict(_proxy_headers())
+    a = request.headers.get("authorization") or request.headers.get("Authorization")
+    if a:
+        h["authorization"] = a
+    upstream_models = []
+    upstream_status = None
+    try:
+        r = _proxy("GET", "/models", headers=h)
+        upstream_status = r.status_code
+        if r.status_code == 200:
+            data = r.json()
+            upstream_models = data.get("models", data) if isinstance(data, dict) else data
+    except Exception as e:
+        upstream_status = f"error: {e}"
+
+    try:
+        sync_openrouter_free_models()
+    except Exception:
+        pass
+    try:
+        sync_freellmapi_models()
+    except Exception:
+        pass
+
+    merged = []
+    for m in upstream_models:
+        if isinstance(m, dict):
+            mm = dict(m)
+            mm["enabled"] = True
+            merged.append(mm)
+        else:
+            merged.append(m)
+    for m in CUSTOM_MODELS.values():
+        mm = dict(m)
+        mm["enabled"] = True
+        merged.append(mm)
+    return {
+        "models": merged,
+        "custom": list(CUSTOM_MODELS.values()),
+        "upstream_count": len(upstream_models),
+        "upstream_status": upstream_status,
+        "custom_count": len(CUSTOM_MODELS),
+    }
+
+@app.get("/tools/gateway")
+def tools_gateway():
+    return list_gateway_tools()
+
+@app.post("/tools/gateway/call")
+async def tools_gateway_call(request: Request):
+    return await call_gateway_tool(request)
+
+# ---------- Broker Integration Routes ----------
+
+@app.post("/api/agent/chat")
+async def proxy_to_broker_chat(request: Request):
+    """Relays agent task submissions to the broker service."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    async with httpx.Client(timeout=30.0) as client:
+        try:
+            resp = await client.post(f"{BROKER_URL.rstrip('/')}/api/agent/chat", json=body)
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+        except Exception as e:
+            return JSONResponse({"error": f"Failed to connect to broker: {e}"}, status_code=502)
+
+@app.get("/api/agent/status/{job_id}")
+async def proxy_to_broker_status(job_id: str):
+    """Polls job status from the broker service."""
+    async with httpx.Client(timeout=30.0) as client:
+        try:
+            resp = await client.get(f"{BROKER_URL.rstrip('/')}/api/agent/status/{job_id}")
+            return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+        except Exception as e:
+            return JSONResponse({"error": f"Failed to fetch job status from broker: {e}"}, status_code=502)
+
+# ---------- Workspace & Conversations ----------
 
 @app.get("/workspace")
 async def workspace(request: Request):
@@ -62,6 +315,16 @@ async def workspace(request: Request):
     except Exception:
         return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
 
+@app.get("/conversations")
+async def conversations(request: Request):
+    h = dict(_proxy_headers())
+    a = request.headers.get("authorization") or request.headers.get("Authorization")
+    if a:
+        h["authorization"] = a
+    r, err = _safe_proxy("GET", "/conversations", headers=h)
+    if err:
+        return JSONResponse(content=err, status_code=502)
+    return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
 
 @app.post("/conversations")
 async def conversations_post(request: Request):
@@ -87,7 +350,6 @@ async def conversations_post(request: Request):
         return JSONResponse(content=err, status_code=502)
     return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
 
-
 @app.post("/conversations/{conversation_id}/messages")
 async def conversations_messages_post(conversation_id: str, request: Request):
     h = dict(_proxy_headers())
@@ -112,3 +374,160 @@ async def conversations_messages_post(conversation_id: str, request: Request):
     if err:
         return JSONResponse(content=err, status_code=502)
     return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
+
+@app.get("/operations/{operation_id}/events")
+def operation_events(operation_id: str, after_seq: int = 0, limit: int = 50):
+    with OPERATION_LOCK:
+        op = OPERATION_EVENTS.get(operation_id)
+        if op is None:
+            return {"operation_id": operation_id, "status": "unknown", "events": []}
+        events = [e for e in op["events"] if e["seq"] > after_seq]
+        if limit and limit > 0:
+            events = events[-limit:]
+        return {"operation_id": operation_id, "status": op["status"], "events": events}
+
+# ---------- FreeLLMAPI Sync & Forwarding ----------
+
+def _freellmapi_headers() -> dict:
+    h = {"Content-Type": "application/json"}
+    if FREELLMAPI_KEY:
+        h["Authorization"] = f"Bearer {FREELLMAPI_KEY}"
+    return h
+
+def fetch_freellmapi_models() -> list:
+    if not FREELLMAPI_URL:
+        return []
+    try:
+        with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30.0)) as client:
+            r = client.get(f"{FREELLMAPI_URL.rstrip('/')}/v1/models", headers=_freellmapi_headers())
+            if r.status_code == 200:
+                data = r.json()
+                return data.get("data", data) if isinstance(data, dict) else data
+    except Exception:
+        pass
+    return []
+
+def sync_freellmapi_models() -> dict:
+    models = fetch_freellmapi_models()
+    added = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id") or "")
+        if mid == "" or mid in CUSTOM_MODELS:
+            continue
+        CUSTOM_MODELS[mid] = {
+            "id": mid,
+            "name": m.get("name", mid),
+            "provider": "freellmapi",
+            "endpoint": FREELLMAPI_URL,
+            "context_length": m.get("context_length", 8192),
+            "supports_tools": m.get("supports_tools", False),
+            "created_at": time.time(),
+        }
+        added.append(mid)
+    if added:
+        save_json(CUSTOM_MODELS_FILE, CUSTOM_MODELS)
+    return {"added": added, "total": len(models)}
+
+def forward_freellmapi(body: dict) -> Response:
+    url = f"{FREELLMAPI_URL.rstrip('/')}/v1/chat/completions"
+    headers = _freellmapi_headers()
+    headers["HTTP-Referer"] = "http://localhost:8765"
+    headers["X-Title"] = "AgileBot Gateway"
+    fixed_body = dict(body)
+    fixed_body["model"] = "auto"
+    with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+        r = client.post(url, json=fixed_body, headers=headers)
+    return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+
+def forward_openrouter(endpoint: str, body: dict) -> Response:
+    url = f"{endpoint.rstrip('/')}/chat/completions"
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {OPENROUTER_KEY}",
+        "http-referer": "http://localhost:8765",
+        "x-title": "AgileBot Gateway",
+    }
+    with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+        r = client.post(url, json=body, headers=headers)
+    return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+
+def fetch_openrouter_free_models():
+    if not OPENROUTER_KEY:
+        return []
+    try:
+        with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30.0)) as client:
+            r = client.get("https://openrouter.ai/api/v1/models", headers={"Authorization": f"Bearer {OPENROUTER_KEY}"})
+            if r.status_code == 200:
+                data = r.json()
+                return [m for m in data.get("data", []) if ":free" in m.get("id", "")]
+    except Exception:
+        pass
+    return []
+
+def sync_openrouter_free_models():
+    models = fetch_openrouter_free_models()
+    added = []
+    for m in models:
+        mid = m.get("id", "")
+        if mid not in CUSTOM_MODELS:
+            CUSTOM_MODELS[mid] = {
+                "id": mid,
+                "name": m.get("name", mid),
+                "provider": "openrouter",
+                "endpoint": "https://openrouter.ai/api/v1",
+                "context_length": m.get("context_length", 8192),
+                "created_at": time.time(),
+            }
+            added.append(mid)
+    if added:
+        save_json(CUSTOM_MODELS_FILE, CUSTOM_MODELS)
+    return {"added": added}
+
+def _is_custom_model(model_id: str) -> bool:
+    if not model_id:
+        return False
+    if model_id in CUSTOM_MODELS or model_id in CUSTOM_MODEL_ALIASES:
+        return True
+    if model_id.startswith("freellmapi/") or model_id.startswith("openrouter/"):
+        return True
+    return False
+
+def _handle_custom_conversation(model_id: str, message: str, conversation_id: str | None) -> dict:
+    conv_id = conversation_id or uuid.uuid4().hex
+    return {
+        "status": "completed",
+        "conversation": {"id": conv_id, "name": (message or "New Chat")[:40]},
+        "timeline": [],
+        "has_more_older": False,
+    }
+
+def list_gateway_tools():
+    return {"tools": list(BUILTIN_TOOLS.values())}
+
+def call_gateway_tool(request: Request):
+    return {"ok": True}
+
+@app.get("/{path:path}")
+async def proxy_get(path: str, request: Request):
+    h = dict(_proxy_headers())
+    a = request.headers.get("authorization") or request.headers.get("Authorization")
+    if a:
+        h["authorization"] = a
+    r = _proxy("GET", f"/{path}", headers=h)
+    return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
+
+@app.post("/{path:path}")
+async def proxy_post(path: str, request: Request):
+    h = dict(_proxy_headers())
+    a = request.headers.get("authorization") or request.headers.get("Authorization")
+    if a:
+        h["authorization"] = a
+    body = await request.body()
+    r = _proxy("POST", f"/{path}", body=body, headers=h)
+    return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
