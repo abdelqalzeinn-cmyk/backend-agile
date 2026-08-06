@@ -367,30 +367,51 @@ async def conversations_post(request: Request):
         return JSONResponse(content=err, status_code=502)
     return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
 
-@app.get("/conversations/{conversation_id}/timeline")
-def conversations_timeline(conversation_id: str, request: Request):
-    conv = LOCAL_CONVERSATIONS.get(conversation_id)
-    if conv is None:
-        h = dict(_proxy_headers())
-        a = request.headers.get("authorization") or request.headers.get("Authorization")
-        if a:
-            h["authorization"] = a
-        r, err = _safe_proxy("GET", f"/conversations/{conversation_id}/timeline", headers=h)
-        if err:
-            return JSONResponse(content=err, status_code=502)
-        return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
+@app.post("/conversations/{conversation_id}/messages")
+async def conversations_messages_post(conversation_id: str, request: Request):
+    h = dict(_proxy_headers())
+    a = request.headers.get("authorization") or request.headers.get("Authorization")
+    if a:
+        h["authorization"] = a
+    
+    # Read the raw body safely as text first to prevent JSON decode crashes
+    body_bytes = await request.body()
+    body_json = {}
+    
+    if body_bytes:
+        try:
+            body_json = json.loads(body_bytes.decode('utf-8'))
+        except Exception:
+            # If it's a raw string payload, wrap it into a message dictionary
+            body_json = {"message": body_bytes.decode('utf-8', errors='ignore')}
 
-    blocks = []
-    seq = 1
-    for m in conv.get("messages", []):
-        role = m.get("role", "user")
-        blocks.append(_make_block(role, m.get("content", ""), seq))
-        seq += 1
-    return JSONResponse(content={
-        "conversation": {"id": conv.get("id", conversation_id), "name": conv.get("name", "")},
-        "timeline": blocks,
-        "has_more_older": False,
-    })
+    # If body_json ended up as a string or non-dict, normalize it
+    if isinstance(body_json, str):
+        try:
+            body_json = json.loads(body_json)
+        except Exception:
+            body_json = {"message": body_json}
+
+    model_id = str(body_json.get("model", "auto"))
+    if model_id == "auto" or not model_id:
+        model_id = "freellmapi/auto"
+
+    message_text = str(body_json.get("message", "") or body_json.get("text", ""))
+    if not message_text and isinstance(body_json.get("context_revision"), dict):
+        rev = body_json.get("context_revision")
+        message_text = str(rev.get("message", "") or rev.get("prompt", ""))
+
+    if _is_custom_model(model_id) or conversation_id in LOCAL_CONVERSATIONS:
+        try:
+            result = _handle_custom_conversation(model_id, message_text, conversation_id)
+            return JSONResponse(content=result, status_code=200)
+        except Exception as e:
+            return JSONResponse({"detail": {"code": "custom_model_error", "model": model_id, "message": str(e)}}, status_code=502)
+
+    r, err = _safe_proxy("POST", f"/conversations/{conversation_id}/messages", body=body_json, headers=h)
+    if err:
+        return JSONResponse(content=err, status_code=502)
+    return Response(content=r.content, status_code=r.status_code, headers=_clean_response_headers(r.headers))
 
 @app.get("/operations/{operation_id}/events")
 def operation_events(operation_id: str, after_seq: int = 0, limit: int = 50):
