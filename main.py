@@ -572,6 +572,37 @@ def _op_finish(operation_id: str, status: str = "completed"):
             OPERATION_EVENTS[operation_id] = op
         op["status"] = status
 
+def _build_tools_payload() -> list:
+    """Build OpenAI-style tool definitions from the gateway catalog."""
+    try:
+        available = list_gateway_tools().get("tools", [])
+    except Exception:
+        return []
+    tools = []
+    seen = set()
+    for t in available:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name") or t.get("id")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        params = t.get("parameters") or {}
+        if not isinstance(params, dict):
+            params = {}
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": t.get("description", ""),
+                "parameters": params if params.get("type") == "object" else {
+                    "type": "object",
+                    "properties": params if isinstance(params, dict) else {},
+                },
+            },
+        })
+    return tools
+
 def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_id: str,
                          assistant_seq: int, tool_calls_acc: list):
     """Background worker: proxies streaming requests and tool interactions via the model broker."""
