@@ -9,6 +9,7 @@ import os
 import json
 import time
 import uuid
+import asyncio
 import threading
 from pathlib import Path
 from fastapi import FastAPI, Request
@@ -321,15 +322,75 @@ async def operations_tool_results_post(operation_id: str, request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    
+
+    # Best-effort forward to broker (kept for logging/compat), failures ignored
     try:
         url = f"{BROKER_URL.rstrip('/')}/operations/{operation_id}/tool_results"
-        with httpx.Client(timeout=10.0) as client:
-            client.post(url, json=body)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(url, json=body)
     except Exception:
         pass
-        
-    return JSONResponse(content={"ok": True})
+
+    # --- Resolve which conversation this tool result belongs to ---
+    # Note: the tool_request block sets "operation_id": conv_id (see _stream_custom_model),
+    # so in practice the client posts here using the conversation_id as the path segment.
+    conv_id = str(body.get("conversation_id") or "") or None
+    if not conv_id and operation_id in LOCAL_CONVERSATIONS:
+        conv_id = operation_id
+    if not conv_id:
+        for cid, c in LOCAL_CONVERSATIONS.items():
+            if c.get("_active_operation_id") == operation_id:
+                conv_id = cid
+                break
+
+    conv = LOCAL_CONVERSATIONS.get(conv_id) if conv_id else None
+    if conv is None:
+        # Nothing we can continue - just acknowledge like before
+        return JSONResponse(content={"ok": True})
+
+    # --- Normalize incoming tool result(s) into individual tool messages ---
+    raw_results = body.get("results") if isinstance(body.get("results"), list) else [body]
+    for entry in raw_results:
+        if not isinstance(entry, dict):
+            continue
+        tc_id = str(entry.get("tool_call_id") or entry.get("id") or entry.get("tool_request_id") or uuid.uuid4().hex)
+        output = entry.get("output")
+        if output is None:
+            output = entry.get("result")
+        if output is None:
+            output = entry.get("content")
+        if output is None:
+            output = entry.get("text", "")
+        if not isinstance(output, str):
+            try:
+                output = json.dumps(output)
+            except Exception:
+                output = str(output)
+        conv["messages"].append({"role": "tool", "tool_call_id": tc_id, "content": output})
+
+    save_json(LOCAL_CONVERSATIONS_FILE, LOCAL_CONVERSATIONS)
+
+    # --- Continue the model turn now that it has the tool output ---
+    model_id = str(body.get("model") or "freellmapi/auto")
+    assistant_seq = conv["next_seq"]
+    conv["next_seq"] = assistant_seq + 1
+    save_json(LOCAL_CONVERSATIONS_FILE, LOCAL_CONVERSATIONS)
+
+    new_operation_id = uuid.uuid4().hex
+    conv["_active_operation_id"] = new_operation_id
+    with OPERATION_LOCK:
+        OPERATION_EVENTS[new_operation_id] = {"status": "running", "events": [], "seq": 0}
+
+    tool_calls_acc: list = []
+    # Run the (blocking) streaming call in a worker thread and wait for it, so that
+    # by the time the client re-fetches the timeline, the model's follow-up reply
+    # is already saved into conv["messages"].
+    await asyncio.to_thread(
+        _stream_custom_model,
+        new_operation_id, model_id, conv["messages"], conv_id, assistant_seq, tool_calls_acc,
+    )
+
+    return JSONResponse(content={"ok": True, "operation_id": new_operation_id})
 
 @app.post("/tools/gateway/call")
 async def tools_gateway_call_endpoint(request: Request):
