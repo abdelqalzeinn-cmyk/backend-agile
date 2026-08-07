@@ -750,9 +750,51 @@ def _build_tools_payload() -> list:
         })
     return tools
 
+AUTO_EXEC_TOOLS = {"web_search", "run_cmds"}
+MAX_AUTO_TOOL_ITERS = 4
+
+def _run_colab_agent_job(message: str, timeout_s: float = 90.0, poll_interval: float = 2.0) -> str:
+    """Submits a task to the broker's Colab job queue and blocks until it's completed.
+    This is what actually wakes up the Colab worker (it long-polls /api/agent/pending)."""
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            r = client.post(f"{BROKER_URL.rstrip('/')}/api/agent/chat", json={"message": message})
+            if r.status_code != 200:
+                return f"Error: broker rejected job ({r.status_code}): {r.text[:200]}"
+            job_id = r.json().get("job_id")
+            if not job_id:
+                return "Error: broker did not return a job_id."
+
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                sr = client.get(f"{BROKER_URL.rstrip('/')}/api/agent/status/{job_id}")
+                if sr.status_code == 200:
+                    data = sr.json()
+                    if data.get("status") == "completed":
+                        return str(data.get("response") or "(no output)")
+                time.sleep(poll_interval)
+            return "Error: timed out waiting for the Colab worker to pick up and finish this job."
+    except Exception as e:
+        return f"Error contacting broker/Colab worker: {e}"
+
+def _execute_auto_tool(name: str, args: dict) -> str:
+    if name == "web_search":
+        query = str(args.get("query", ""))
+        return _run_colab_agent_job(
+            f"Perform a web search for: {query}\nSummarize the most relevant results, including source URLs."
+        )
+    if name == "run_cmds":
+        commands = str(args.get("commands", ""))
+        return _run_colab_agent_job(
+            f"Run the following command(s) in the Colab VM and report the full output:\n{commands}"
+        )
+    return f"Unknown auto tool: {name}"
+
 def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_id: str,
                          assistant_seq: int, tool_calls_acc: list):
-    """Background worker: proxies streaming requests and tool interactions via the model broker."""
+    """Background worker: proxies streaming requests via the model broker. Tool calls for
+    web_search/run_cmds are auto-executed through the Colab job queue and fed back to the
+    model in a loop; any other tool call is surfaced to the client as a permission block."""
     render_id = f"message:{assistant_seq}"
     _op_emit(operation_id, "block_upsert", {
         "block": {
@@ -767,8 +809,8 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
     })
 
     acc = ""
+    current_messages = list(messages)
     try:
-        # Route through your broker service for model execution, commands, and search handling
         url = f"{BROKER_URL.rstrip('/')}/v1/chat/completions"
         headers = {
             "Content-Type": "application/json",
@@ -778,51 +820,120 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
         if FREELLMAPI_KEY:
             headers["Authorization"] = f"Bearer {FREELLMAPI_KEY}"
 
-        sys_msgs = list(messages)
-        if SYSTEM_PROMPT:
-            if not sys_msgs or sys_msgs[0].get("role") != "system":
-                sys_msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + sys_msgs
-            else:
-                sys_msgs[0] = {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + sys_msgs[0].get("content", "")}
+        for iteration in range(MAX_AUTO_TOOL_ITERS + 1):
+            sys_msgs = list(current_messages)
+            if SYSTEM_PROMPT:
+                if not sys_msgs or sys_msgs[0].get("role") != "system":
+                    sys_msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + sys_msgs
+                else:
+                    sys_msgs[0] = {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + sys_msgs[0].get("content", "")}
 
-        tools = _build_tools_payload()
-        body = {
-            "model": model_id if model_id in CUSTOM_MODELS else "auto",
-            "messages": sys_msgs,
-            "stream": True
-        }
-        if tools:
-            body["tools"] = tools
-            body["tool_choice"] = "auto"
+            tools = _build_tools_payload()
+            body = {
+                "model": model_id if model_id in CUSTOM_MODELS else "auto",
+                "messages": sys_msgs,
+                "stream": True
+            }
+            if tools:
+                body["tools"] = tools
+                body["tool_choice"] = "auto"
 
-        with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(120.0, connect=10.0)) as client:
-            with client.stream("POST", url, json=body, headers=headers) as resp:
-                if resp.status_code != 200:
-                    raise RuntimeError(f"Broker stream error {resp.status_code}: {resp.read().decode()[:200]}")
-                for chunk in resp.iter_lines():
-                    for data in _parse_sse_lines(chunk):
-                        try:
-                            piece = json.loads(data)
-                        except Exception:
-                            continue
-                        delta = (piece.get("choices") or [{}])[0].get("delta") or {}
-                        text_delta = delta.get("content") or ""
-                        if text_delta:
-                            acc += text_delta
-                            _op_emit(operation_id, "block_patch", {
-                                "block_id": render_id,
-                                "patch": {"text_append": text_delta},
-                            })
-                        for tc in delta.get("tool_calls") or []:
-                            idx = tc.get("index", 0)
-                            while len(tool_calls_acc) <= idx:
-                                tool_calls_acc.append({"id": "", "name": "", "arguments": ""})
-                            if tc.get("id"):
-                                tool_calls_acc[idx]["id"] = tc["id"]
-                            if tc.get("function", {}).get("name"):
-                                tool_calls_acc[idx]["name"] = tc["function"]["name"]
-                            if tc.get("function", {}).get("arguments"):
-                                tool_calls_acc[idx]["arguments"] += tc["function"]["arguments"]
+            iter_tool_calls: list = []
+            assistant_msg_dict = None
+
+            with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+                with client.stream("POST", url, json=body, headers=headers) as resp:
+                    if resp.status_code != 200:
+                        raise RuntimeError(f"Broker stream error {resp.status_code}: {resp.read().decode()[:200]}")
+                    for chunk in resp.iter_lines():
+                        for data in _parse_sse_lines(chunk):
+                            try:
+                                piece = json.loads(data)
+                            except Exception:
+                                continue
+                            delta = (piece.get("choices") or [{}])[0].get("delta") or {}
+                            text_delta = delta.get("content") or ""
+                            if text_delta:
+                                acc += text_delta
+                                _op_emit(operation_id, "block_patch", {
+                                    "block_id": render_id,
+                                    "patch": {"text_append": text_delta},
+                                })
+                            for tc in delta.get("tool_calls") or []:
+                                idx = tc.get("index", 0)
+                                while len(iter_tool_calls) <= idx:
+                                    iter_tool_calls.append({"id": "", "name": "", "arguments": ""})
+                                if tc.get("id"):
+                                    iter_tool_calls[idx]["id"] = tc["id"]
+                                if tc.get("function", {}).get("name"):
+                                    iter_tool_calls[idx]["name"] = tc["function"]["name"]
+                                if tc.get("function", {}).get("arguments"):
+                                    iter_tool_calls[idx]["arguments"] += tc["function"]["arguments"]
+
+            # Reconstruct the assistant message for this turn (needed so the model sees its
+            # own prior tool_calls when we feed tool results back in the next iteration).
+            parsed_calls = []
+            for tc in iter_tool_calls:
+                if not tc.get("name"):
+                    continue
+                try:
+                    args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                except Exception:
+                    args = {}
+                parsed_calls.append({"id": tc.get("id") or uuid.uuid4().hex, "name": tc["name"], "arguments": args})
+
+            if parsed_calls:
+                assistant_msg_dict = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": pc["id"],
+                            "type": "function",
+                            "function": {"name": pc["name"], "arguments": json.dumps(pc["arguments"])},
+                        }
+                        for pc in parsed_calls
+                    ],
+                }
+                current_messages.append(assistant_msg_dict)
+
+            if not parsed_calls:
+                # No tool calls -> model is done, final text already streamed in `acc`.
+                break
+
+            auto_calls = [tc for tc in parsed_calls if tc["name"] in AUTO_EXEC_TOOLS]
+            client_calls = [tc for tc in parsed_calls if tc["name"] not in AUTO_EXEC_TOOLS]
+
+            if client_calls or iteration >= MAX_AUTO_TOOL_ITERS:
+                # Surface remaining calls to the client for execution (e.g. Roblox-side tools),
+                # same as before. Any auto tools mixed in here also get surfaced rather than
+                # silently dropped, so nothing gets lost.
+                for tc in parsed_calls:
+                    req_id = tc["id"]
+                    tool_request = {
+                        "id": req_id, "tool_name": tc["name"], "name": tc["name"],
+                        "arguments": tc["arguments"], "args": tc["arguments"],
+                        "conversation_id": conv_id, "operation_id": conv_id
+                    }
+                    _op_emit(operation_id, "block_upsert", {"block": {
+                        "render_id": f"tool_request:{req_id}", "id": req_id, "role": "permission",
+                        "text": "", "tool_request": tool_request, "tool_request_id": req_id,
+                        "operation_id": conv_id, "status": "pending"
+                    }})
+                    tool_calls_acc.append(tc)
+                break
+
+            # All tool calls this turn are auto-executable (web_search/run_cmds) -> run them
+            # via the Colab job queue, feed the results back, and loop for a follow-up answer.
+            for tc in auto_calls:
+                result_text = _execute_auto_tool(tc["name"], tc["arguments"])
+                current_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result_text,
+                })
+                tool_calls_acc.append(tc)
+            # loop continues to next iteration for the model's follow-up
 
         _op_emit(operation_id, "block_patch", {
             "block_id": render_id,
@@ -832,32 +943,13 @@ def _stream_custom_model(operation_id: str, model_id: str, messages: list, conv_
 
         conv = LOCAL_CONVERSATIONS.get(conv_id)
         if conv is not None:
-            conv["messages"].append({"role": "assistant", "content": acc})
+            if acc:
+                conv["messages"].append({"role": "assistant", "content": acc})
+            else:
+                # Persist whatever intermediate messages (tool calls/results) were produced,
+                # even if this turn ended on a pending client tool request with no text yet.
+                conv["messages"] = current_messages
             save_json(LOCAL_CONVERSATIONS_FILE, LOCAL_CONVERSATIONS)
-
-        # Handle parsed tool calls (including web search execution if requested by model)
-        parsed_calls = []
-        for tc in tool_calls_acc:
-            if not tc.get("name"):
-                continue
-            try:
-                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
-            except Exception:
-                args = {}
-            parsed_calls.append({"id": tc.get("id") or uuid.uuid4().hex, "name": tc["name"], "arguments": args})
-        
-        for tc in parsed_calls:
-            req_id = tc["id"]
-            tool_request = {
-                "id": req_id, "tool_name": tc["name"], "name": tc["name"],
-                "arguments": tc["arguments"], "args": tc["arguments"],
-                "conversation_id": conv_id, "operation_id": conv_id
-            }
-            _op_emit(operation_id, "block_upsert", {"block": {
-                "render_id": f"tool_request:{req_id}", "id": req_id, "role": "permission",
-                "text": "", "tool_request": tool_request, "tool_request_id": req_id,
-                "operation_id": conv_id, "status": "pending"
-            }})
 
     except Exception as e:
         _op_emit(operation_id, "block_patch", {
