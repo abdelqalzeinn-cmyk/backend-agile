@@ -35,18 +35,61 @@ CUSTOM_MODELS_FILE = DATA_DIR / "custom_models.json"
 SYSTEM_PROMPT_FILE = DATA_DIR / "system_prompt.txt"
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are AgileBot, an expert Roblox Studio AI assistant and developer that writes clean, correct Luau code.\n"
-    "You have access to tools that operate INSIDE Roblox Studio (create_animation, search_animations, search_sounds), "
-    "a live web search tool (web_search) to look up up-to-date documentation and facts, "
-    "and a command execution tool (run_cmds) to run scripts, system commands, or environment setup steps.\n"
-    "CRITICAL TOOL-USAGE RULE: When the user asks you to build, animate, modify, search anything in their "
-    "experience, look up live technical information, or run commands, you MUST call the matching tool via a tool_call — NEVER just describe "
-    "the steps, NEVER hand back code for the user to run manually, and NEVER tell the user to execute terminal commands themselves. The tools run them for the user.\n"
-    "When you call a tool, you MUST populate EVERY relevant parameter with a concrete value. Do NOT call a tool with empty or missing arguments.\n"
-    "Only fall back to writing Luau code in the chat when the user explicitly asks for raw script text.\n"
-    "When writing Luau: follow Roblox Luau conventions, use task.spawn/wait instead of spawn/wait where appropriate, "
-    "guard pcall around HttpService and DataStore calls, and never use Lua 5.1-only syntax (no +=, no const). "
-    "Keep scripts small, readable, and production-safe."
+    "You are AgileBot, an expert Roblox Studio AI assistant and developer that writes clean, correct Luau code.\n\n"
+
+    "TOOLS\n"
+    "- create_animation, search_animations, search_sounds: run INSIDE Roblox Studio.\n"
+    "- web_search: live web search for up-to-date docs/facts, executed via a Colab worker. Results can take a "
+    "few seconds — do not repeat the same query while waiting.\n"
+    "- run_cmds: runs shell commands/scripts in the Colab VM, not in Roblox Studio. Use it for setup, file work, "
+    "or anything that needs a real shell — never for Roblox-side actions.\n\n"
+
+    "CORE LOOP\n"
+    "- The latest user message is the objective. Earlier conversation is context only and may be stale.\n"
+    "- When the user asks you to build, animate, search, look up live information, or run a command, you MUST "
+    "call the matching tool via a tool_call. NEVER just describe the steps, NEVER hand back code or commands for "
+    "the user to run manually, and NEVER say you can't access the web/terminal — you can, via these tools.\n"
+    "- When you call a tool, populate EVERY relevant parameter with a concrete, real value. Never call a tool "
+    "with empty, placeholder, or guessed-blank arguments.\n"
+    "- Only fall back to writing Luau in chat when the user explicitly asks for raw script text, or after a tool "
+    "result gives you the concrete facts (e.g. search results, rig type) you need to write it correctly.\n"
+    "- Prefer action over narration: don't announce what you're about to do, just do it, then report the result.\n"
+    "- Do not repeat an identical tool call expecting a different result. If a search/command comes back weak or "
+    "empty, change the query/approach rather than retrying verbatim.\n"
+    "- Stop once the request is satisfied. Do not keep adding unrequested changes or extra tool calls.\n"
+    "- Never describe unfinished or unverified work as complete. Only claim success if the tool result actually "
+    "shows it succeeded (e.g. run_cmds exit code, search actually returned results).\n"
+    "- If a tool result shows an error, fix or report the specific failure — do not silently retry blind or "
+    "pretend it worked.\n\n"
+
+    "READ-ONLY VS ACTION\n"
+    "- Questions, explanations, and diagnosis (\"what's wrong with this script\", \"how does X work\") are answered "
+    "directly or via web_search — do not build/animate/execute anything the user didn't ask for.\n"
+    "- Only use create_animation/search_animations/search_sounds/run_cmds when the user's request actually "
+    "requires changing or running something.\n"
+    "- Don't turn a diagnosis request into an unrequested fix. Don't turn a \"what's the latest version\" question "
+    "into a code change.\n\n"
+
+    "RIG / ANIMATION COMPATIBILITY\n"
+    "- R6 and R15 animations are not interchangeable. Never apply an R15 animation to an R6 rig or vice versa.\n"
+    "- Before creating, replacing, or wiring any character animation, confirm the target rig type from live "
+    "evidence (e.g. via search_animations results or explicit user statement) — never infer rig type from names "
+    "or appearance alone.\n"
+    "- If rig type can't be established and the user hasn't stated it, ask one concise clarifying question rather "
+    "than guessing.\n"
+    "- Prefer using an existing AnimationId over hand-rolled custom animating when one fits.\n\n"
+
+    "LUAU CODE STANDARDS\n"
+    "- Follow Roblox Luau conventions: use task.spawn/task.wait instead of the deprecated spawn/wait.\n"
+    "- Guard pcall around HttpService and DataStore calls.\n"
+    "- Never use Lua 5.1-only syntax (no +=, no const, etc. that Luau doesn't support in this context).\n"
+    "- Keep scripts small, readable, and production-safe — no dead code, no giant unexplained blocks.\n\n"
+
+    "RESPONSE STYLE\n"
+    "- Keep final answers concise and user-facing; skip internal mechanics unless asked.\n"
+    "- Do not output fake progress updates, promise future work, or invent blockers.\n"
+    "- Do not claim a build/search/command succeeded unless the tool result proves it.\n"
+    "- Only use emojis if the user explicitly asks for them."
 )
 
 def load_json(path: Path, default):
@@ -137,6 +180,202 @@ BUILTIN_TOOLS = {
                 }
             },
             "required": ["keyframes"]
+        },
+    },
+    "scene_overview": {
+        "name": "scene_overview",
+        "description": "Get a high-level layout of the current place: top-level services, major landmarks, and rough object-count signature per subtree. Orientation only, not an exact index — follow up with instance_find for exact targets.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scope_path": {"type": "string", "description": "Optional subtree root to limit the overview to (e.g. 'Workspace')."}
+            },
+            "required": [],
+        },
+    },
+    "instance_find": {
+        "name": "instance_find",
+        "description": "Search Roblox instances by name/path in the live place. Use scope_path to limit to one subtree and class_name to narrow by ClassName.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Instance name or partial name to search for."},
+                "scope_path": {"type": "string", "description": "Optional subtree root to search within."},
+                "class_name": {"type": "string", "description": "Optional ClassName filter, e.g. 'Part', 'Script'."}
+            },
+            "required": ["query"],
+        },
+    },
+    "instance_inspect": {
+        "name": "instance_inspect",
+        "description": "Get exact properties/attributes/children of one known Instance. Use only when you already have an exact ref or path — use instance_find first if the target is unknown.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Instance ref, if known from a prior tool result."},
+                "path": {"type": "string", "description": "Full workspace/hierarchy path to the instance."}
+            },
+            "required": [],
+        },
+    },
+    "script_inventory": {
+        "name": "script_inventory",
+        "description": "List all Script/LocalScript/ModuleScript instances in the place (or a subtree), with path and basic size info. Use for broad discovery before searching contents.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scope_path": {"type": "string", "description": "Optional subtree root to limit the inventory to."}
+            },
+            "required": [],
+        },
+    },
+    "script_find": {
+        "name": "script_find",
+        "description": "Find scripts by name/path pattern. Use before script_read/script_grep when the exact script path is unknown.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Script name or partial name to search for."},
+                "scope_path": {"type": "string", "description": "Optional subtree root to search within."}
+            },
+            "required": ["query"],
+        },
+    },
+    "script_grep": {
+        "name": "script_grep",
+        "description": "Search script source code across the place (or a subtree) for a literal string or pattern. Returns matching paths and line context.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Literal text or pattern to search for in script source."},
+                "scope_path": {"type": "string", "description": "Optional subtree root to limit the search to."},
+                "case_sensitive": {"type": "boolean", "description": "Whether the match is case-sensitive (default false)."}
+            },
+            "required": ["pattern"],
+        },
+    },
+    "script_read": {
+        "name": "script_read",
+        "description": "Read the exact current source of one known script (by ref or path), optionally a line range. Always use this to get the real source_hash/raw_source before writing or replacing.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Script ref, if known from a prior tool result."},
+                "path": {"type": "string", "description": "Full path to the script instance."},
+                "start_line": {"type": "number", "description": "Optional starting line (1-indexed)."},
+                "end_line": {"type": "number", "description": "Optional ending line (inclusive)."}
+            },
+            "required": [],
+        },
+    },
+    "script_write": {
+        "name": "script_write",
+        "description": "Overwrite the ENTIRE source of one script with new content. Use for creating a new script or a full rewrite; use script_replace for a small targeted edit instead.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Script ref, if known from a prior tool result."},
+                "path": {"type": "string", "description": "Full path to the script instance (created if it doesn't exist)."},
+                "class_name": {"type": "string", "description": "Script class to create if new: 'Script', 'LocalScript', or 'ModuleScript'."},
+                "source": {"type": "string", "description": "Complete new source code for the script."}
+            },
+            "required": ["source"],
+        },
+    },
+    "script_write_many": {
+        "name": "script_write_many",
+        "description": "Overwrite the entire source of multiple scripts in one batched call. Each entry behaves like script_write.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "writes": {
+                    "type": "array",
+                    "description": "List of full-source writes to apply.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ref": {"type": "string"},
+                            "path": {"type": "string"},
+                            "class_name": {"type": "string"},
+                            "source": {"type": "string"}
+                        },
+                        "required": ["source"]
+                    }
+                }
+            },
+            "required": ["writes"],
+        },
+    },
+    "script_replace": {
+        "name": "script_replace",
+        "description": "Apply one exact find/replace edit to a script's existing source. old_string must be an exact, unique substring of the script's CURRENT source (re-read with script_read first if unsure) — do not guess it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Script ref, if known from a prior tool result."},
+                "path": {"type": "string", "description": "Full path to the script instance."},
+                "old_string": {"type": "string", "description": "Exact, unique substring of the current source to replace."},
+                "new_string": {"type": "string", "description": "Replacement text."},
+                "source_hash": {"type": "string", "description": "Hash of the source this edit was computed against, from the latest script_read, to guard against stale edits."}
+            },
+            "required": ["old_string", "new_string"],
+        },
+    },
+    "script_replace_many": {
+        "name": "script_replace_many",
+        "description": "Apply multiple exact find/replace edits to one script atomically. All edits succeed together or the script is left unchanged.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string"},
+                "path": {"type": "string"},
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"}
+                        },
+                        "required": ["old_string", "new_string"]
+                    }
+                },
+                "source_hash": {"type": "string", "description": "Hash of the source these edits were computed against."}
+            },
+            "required": ["edits"],
+        },
+    },
+    "verify_changes": {
+        "name": "verify_changes",
+        "description": "Re-read a script/instance after an edit and confirm the change actually applied as intended. Use after script_write/script_replace before claiming success.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string"},
+                "path": {"type": "string"},
+                "expected_hash": {"type": "string", "description": "Optional expected source_hash to confirm against."}
+            },
+            "required": [],
+        },
+    },
+    "execute_lua": {
+        "name": "execute_lua",
+        "description": "Run a small, focused Luau snippet in Studio for things no other tool covers: creating non-script Instances, runtime state/property probes, aggregation/counting across many objects, or geometry computation. NOT for authoring script source (use script_write/script_replace). Must explicitly return the values needed; do not rely on print. Keep snippets small and purpose-specific, not a dump.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Luau source to execute. Must end with an explicit return of the needed value(s)."}
+            },
+            "required": ["code"],
+        },
+    },
+    "startup_smoke_test": {
+        "name": "startup_smoke_test",
+        "description": "Run the place's startup scripts in a fresh simulated start to confirm nothing errors. Use after larger changes when startup correctness matters, not for every small edit.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
         },
     },
     "web_search": {
