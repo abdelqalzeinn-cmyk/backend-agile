@@ -362,7 +362,7 @@ async def proxy_to_broker_chat(request: Request):
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
-    async with httpx.Client(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             resp = await client.post(f"{BROKER_URL.rstrip('/')}/api/agent/chat", json=body)
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
@@ -372,7 +372,7 @@ async def proxy_to_broker_chat(request: Request):
 @app.get("/api/agent/status/{job_id}")
 async def proxy_to_broker_status(job_id: str):
     """Polls job status from the broker service."""
-    async with httpx.Client(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             resp = await client.get(f"{BROKER_URL.rstrip('/')}/api/agent/status/{job_id}")
             return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
